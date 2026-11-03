@@ -1,0 +1,614 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Quest 3 MR Physics Sandbox</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body { margin: 0; overflow: hidden; background: #111; color: white; font-family: sans-serif; }
+        #info { position: absolute; top: 20px; left: 20px; z-index: 100; pointer-events: none; text-shadow: 1px 1px 2px black; background: rgba(0,0,0,0.7); padding: 15px; border-radius: 10px; border: 1px solid #444; }
+        h1 { margin: 0 0 10px 0; font-size: 20px; color: #00ffcc; }
+        p { margin: 0; line-height: 1.6; font-size: 14px; }
+        .highlight { color: #ffcc00; font-weight: bold; font-size: 15px; display: block; margin-top: 10px; }
+    </style>
+</head>
+<body>
+    <div id="info">
+        <h1>MR Physics Sandbox</h1>
+        <p>
+        1. <b>Squeeze Grip:</b> Pick up objects<br/>
+        2. <b>Release Grip:</b> Drop or Throw<br/>
+        3. <b>Right Thumbstick:</b> Cycle Physics Modes<br/>
+        4. <b>Right Trigger:</b> Toggle Debug Hulls<br/>
+        5. <b>You can push objects while holding other objects, too.</b>
+        <span class="highlight">Current Mode: <br/><span id="mode-text" style="color:white; font-weight:normal;">Offset + Plain Drop (No Throw)</span></span>
+        </p>
+    </div>
+
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+            "@dimforge/rapier3d-compat": "https://unpkg.com/@dimforge/rapier3d-compat@0.13.1/rapier.es.js"
+        }
+    }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
+        import RAPIER from '@dimforge/rapier3d-compat';
+
+        let scene, camera, renderer, world;
+        const clock = new THREE.Clock();
+
+        const interactables = [];
+        let animationMixers = [];
+
+        // Modes Configuration (Removed Fist Boxing for Stability)
+        const MODES = [
+            { grab: 'offset', throw: 'drop', text: 'Offset + Plain Drop (No Throw)' },
+            { grab: 'snap', throw: 'drop', text: 'Snap + Plain Drop (No Throw)' },
+            { grab: 'offset', throw: 'gravity', text: 'Offset + Gravity Throw' },
+            { grab: 'snap', throw: 'gravity', text: 'Snap + Gravity Throw' },
+            { grab: 'offset', throw: 'float', text: 'Offset + Zero-G Float' },
+            { grab: 'snap', throw: 'float', text: 'Snap + Zero-G Float' },
+            { grab: 'offset', throw: 'righting', text: 'Offset + Active Self-Righting' },
+            { grab: 'snap', throw: 'righting', text: 'Snap + Active Self-Righting' }
+        ];
+        let currentModeIndex = 0;
+
+        // Debug Hull State
+        let hullsVisible = false;
+        let rightTriggerPressed = false;
+        let debugLines;
+        
+        // Mode Switching
+        let rightThumbstickPressed = false;
+
+        const hands = [];
+        let uiCanvas, uiCtx, uiTex;
+
+        init();
+
+        async function init() {
+            await RAPIER.init();
+            world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
+
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+            
+            const dirLight = new THREE.DirectionalLight(0xffffff, 2.5);
+            dirLight.position.set(2, 5, 2);
+            dirLight.castShadow = true;
+            scene.add(dirLight);
+            scene.add(new THREE.AmbientLight(0xffffff, 1.2));
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            renderer.xr.setReferenceSpaceType('local-floor'); 
+            document.body.appendChild(renderer.domElement);
+
+            document.body.appendChild(ARButton.createButton(renderer, {
+                requiredFeatures: ['local-floor'],
+                optionalFeatures: ['hand-tracking']
+            }));
+
+            setupFloor();
+            setupControllers();
+
+            spawnBall(-0.3, 0.4, -0.6); 
+            spawnTestCube(-0.6, 0.4, -0.6);
+            spawnAnimatedGLTF(0.0, 0.4, -0.6); 
+            spawnAnimatedFBX(0.4, 0.4, -0.6); 
+            spawnWeightedCone(0.8, 0.4, -0.6);
+            spawnWeebleDuck(0.8, 0.4, -0.6);
+
+            // Setup Rapier Hull Debug Wireframes
+            const debugMaterial = new THREE.LineBasicMaterial({ color: 0x00ffcc, vertexColors: true });
+            const debugGeometry = new THREE.BufferGeometry();
+            debugLines = new THREE.LineSegments(debugGeometry, debugMaterial);
+            debugLines.visible = false;
+            scene.add(debugLines);
+
+            renderer.setAnimationLoop(render);
+        }
+
+        function setupFloor() {
+            const floorGeo = new THREE.PlaneGeometry(10, 10);
+            const floorMat = new THREE.ShadowMaterial({ opacity: 0.5 });
+            const floorMesh = new THREE.Mesh(floorGeo, floorMat);
+            floorMesh.rotation.x = -Math.PI / 2;
+            floorMesh.receiveShadow = true;
+            scene.add(floorMesh);
+
+            const floorDesc = RAPIER.RigidBodyDesc.fixed().setTranslation(0, 0, 0);
+            const floorBody = world.createRigidBody(floorDesc);
+            const floorCollider = RAPIER.ColliderDesc.cuboid(5, 0.05, 5).setTranslation(0, -0.05, 0);
+            world.createCollider(floorCollider, floorBody);
+        }
+
+        function setupControllers() {
+            for (let i = 0; i < 2; i++) {
+                const grip = renderer.xr.getControllerGrip(i);
+                
+                const handGeo = new THREE.BoxGeometry(0.04, 0.04, 0.06);
+                const handMat = new THREE.MeshStandardMaterial({ color: 0x555555, wireframe: true });
+                const handMesh = new THREE.Mesh(handGeo, handMat);
+                grip.add(handMesh);
+                scene.add(grip);
+
+                if (i === 0) setupVRUI(grip);
+
+                const handState = {
+                    index: i,
+                    grip: grip,
+                    grabbedItem: null,
+                    prevPos: new THREE.Vector3(),
+                    velocity: new THREE.Vector3(),
+                    offsetMatrix: new THREE.Matrix4()
+                };
+
+                hands.push(handState);
+
+                grip.addEventListener('squeezestart', () => onGrabStart(handState));
+                grip.addEventListener('squeezeend', () => onGrabEnd(handState));
+            }
+        }
+
+        function setupVRUI(controller) {
+            uiCanvas = document.createElement('canvas');
+            uiCanvas.width = 512;
+            uiCanvas.height = 128;
+            uiCtx = uiCanvas.getContext('2d');
+            uiTex = new THREE.CanvasTexture(uiCanvas);
+            
+            const uiMat = new THREE.MeshBasicMaterial({ map: uiTex, transparent: true, depthWrite: false });
+            const uiMesh = new THREE.Mesh(new THREE.PlaneGeometry(0.16, 0.04), uiMat); 
+            
+            uiMesh.position.set(0, 0.06, -0.05);
+            uiMesh.rotation.x = -Math.PI / 4; 
+            
+            controller.add(uiMesh);
+            updateVRUI(MODES[0].text);
+        }
+
+        function updateVRUI(text) {
+            if (!uiCtx) return;
+            uiCtx.clearRect(0, 0, uiCanvas.width, uiCanvas.height);
+            
+            uiCtx.fillStyle = 'rgba(20, 20, 20, 0.85)';
+            uiCtx.fillRect(0, 0, uiCanvas.width, uiCanvas.height);
+            uiCtx.strokeStyle = '#00ffcc';
+            uiCtx.lineWidth = 10;
+            uiCtx.strokeRect(0, 0, uiCanvas.width, uiCanvas.height);
+            
+            uiCtx.fillStyle = '#ffffff';
+            uiCtx.font = 'bold 34px sans-serif';
+            uiCtx.textAlign = 'center';
+            uiCtx.textBaseline = 'middle';
+            uiCtx.fillText(text, uiCanvas.width / 2, uiCanvas.height / 2);
+            
+            uiTex.needsUpdate = true;
+        }
+
+        function onGrabStart(hand) {
+            let closestItem = null;
+            let minDistance = 0.20; 
+            
+            const gripPos = new THREE.Vector3();
+            hand.grip.getWorldPosition(gripPos);
+
+            for (let item of interactables) {
+                const itemPos = new THREE.Vector3();
+                item.mesh.getWorldPosition(itemPos);
+                
+                const dist = gripPos.distanceTo(itemPos);
+                if (dist < minDistance) {
+                    minDistance = dist;
+                    closestItem = item;
+                }
+            }
+
+            if (closestItem) {
+                hand.grabbedItem = closestItem;
+                const body = closestItem.body;
+                
+                body.setBodyType(RAPIER.RigidBodyType.KinematicPositionBased, true);
+                
+                const activeGrabMode = MODES[currentModeIndex].grab;
+
+                if (activeGrabMode === 'offset') {
+                    hand.offsetMatrix.copy(hand.grip.matrixWorld).invert().multiply(closestItem.mesh.matrixWorld);
+                } else {
+                    const handPos = new THREE.Vector3();
+                    hand.grip.getWorldPosition(handPos);
+                    
+                    const itemQuat = new THREE.Quaternion();
+                    closestItem.mesh.getWorldQuaternion(itemQuat);
+                    
+                    const targetMat = new THREE.Matrix4().compose(handPos, itemQuat, new THREE.Vector3(1,1,1));
+                    hand.offsetMatrix.copy(hand.grip.matrixWorld).invert().multiply(targetMat);
+                }
+            }
+        }
+
+        function onGrabEnd(hand) {
+            if (hand.grabbedItem) {
+                const item = hand.grabbedItem;
+                const body = item.body;
+                body.setBodyType(RAPIER.RigidBodyType.Dynamic, true);
+                
+                const activeThrowMode = MODES[currentModeIndex].throw;
+
+                // Restoring default dampings (fixes the eternal rolling on Weeble bases!)
+                body.setGravityScale(1.0, true);
+                body.setLinearDamping(item.defaultLinDamp || 0.0);
+                body.setAngularDamping(item.defaultAngDamp || 0.0);
+
+                if (activeThrowMode === 'float') {
+                    body.setGravityScale(0, true);
+                    body.setLinearDamping(2.5);
+                    body.setAngularDamping(2.0);
+                    if (hand.velocity.length() < 0.5) hand.velocity.y += 0.5;
+                } 
+                else if (activeThrowMode === 'righting') {
+                    body.setAngularDamping(8.0); 
+                }
+
+                // --- VELOCITY APPLICATION LOGIC ---
+                if (activeThrowMode === 'drop') {
+                    body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+                    body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+                } else {
+                    let vx = hand.velocity.x * 1.2;
+                    let vy = hand.velocity.y * 1.2;
+                    let vz = hand.velocity.z * 1.2;
+
+                    const maxSpeed = 7.0; 
+                    const speed = Math.sqrt(vx*vx + vy*vy + vz*vz);
+
+                    if (speed > maxSpeed) {
+                        const scale = maxSpeed / speed;
+                        vx *= scale; 
+                        vy *= scale; 
+                        vz *= scale;
+                    }
+
+                    body.setLinvel({ x: vx, y: vy, z: vz }, true);
+                }
+
+                body.wakeUp();
+                hand.grabbedItem = null;
+            }
+        }
+
+        function buildConvexHullForMesh(rootMesh, x, y, z, addWeightedBase = false) {
+            const vertices = [];
+            rootMesh.updateMatrixWorld(true);
+            
+            rootMesh.traverse((child) => {
+                if (child.isMesh && child.geometry.attributes.position) {
+                    const posAttr = child.geometry.attributes.position;
+                    const worldMat = child.matrixWorld;
+                    for (let i = 0; i < posAttr.count; i++) {
+                        const v = new THREE.Vector3().fromBufferAttribute(posAttr, i);
+                        v.applyMatrix4(worldMat);
+                        vertices.push(v.x, v.y, v.z);
+                    }
+                }
+            });
+
+            if (vertices.length === 0) return;
+
+            const bodyDesc = RAPIER.RigidBodyDesc.dynamic().setTranslation(x, y, z);
+            const body = world.createRigidBody(bodyDesc);
+            
+            const colliderDesc = RAPIER.ColliderDesc.convexHull(new Float32Array(vertices))
+                .setMass(1.0)
+                .setFriction(0.8)
+                .setRestitution(0.2);
+
+            world.createCollider(colliderDesc, body);
+
+            // Set natural dampings so weighted bases eventually settle
+            let defaultLinDamp = 0.0;
+            let defaultAngDamp = 0.0;
+
+            // --- WEEBLE-WOBBLE BASE LOGIC ---
+            if (addWeightedBase) {
+                const box = new THREE.Box3().setFromObject(rootMesh);
+                const size = new THREE.Vector3();
+                box.getSize(size);
+                
+                const baseRadius = Math.max(size.x, size.z) * 0.8; 
+                const bottomY = box.min.y;
+                
+                const baseColliderDesc = RAPIER.ColliderDesc.cylinder(0.01, baseRadius)
+                    .setTranslation(0, bottomY, 0)
+                    .setMass(20.0); 
+                    
+                world.createCollider(baseColliderDesc, body);
+                
+                defaultLinDamp = 0.5;
+                defaultAngDamp = 4.0; 
+                body.setAngularDamping(defaultAngDamp);
+                body.setLinearDamping(defaultLinDamp);
+            }
+
+            body.enableCcd(true); 
+            const inverseQuat = rootMesh.quaternion.clone().invert();
+            const localUp = new THREE.Vector3(0, 1, 0).applyQuaternion(inverseQuat).normalize();
+
+            interactables.push({ 
+                mesh: rootMesh, 
+                body: body, 
+                localUp: localUp,
+                defaultLinDamp: defaultLinDamp,
+                defaultAngDamp: defaultAngDamp
+            });
+        }
+
+        function spawnBall(x, y, z) {
+            const radius = 0.08;
+            const geo = new THREE.SphereGeometry(radius, 32, 32);
+            const mat = new THREE.MeshStandardMaterial({ color: 0xff4444, roughness: 0.2, metalness: 0.1 });
+            const mesh = new THREE.Mesh(geo, mat);
+            scene.add(mesh);
+
+            const bodyDesc = RAPIER.RigidBodyDesc.dynamic().setTranslation(x, y, z);
+            const body = world.createRigidBody(bodyDesc);
+            const colliderDesc = RAPIER.ColliderDesc.ball(radius).setRestitution(0.7).setFriction(0.5);
+            world.createCollider(colliderDesc, body);
+
+            body.enableCcd(true);
+            const inverseQuat = mesh.quaternion.clone().invert();
+            const localUp = new THREE.Vector3(0, 1, 0).applyQuaternion(inverseQuat).normalize();
+
+            interactables.push({ mesh: mesh, body: body, localUp: localUp, defaultLinDamp: 0.0, defaultAngDamp: 0.0 });
+        }
+
+        function spawnTestCube(x, y, z) {
+            const size = 0.15;
+            const geo = new THREE.BoxGeometry(size, size, size);
+            
+            const materials = [
+                new THREE.MeshStandardMaterial({ color: 0xff0000 }), 
+                new THREE.MeshStandardMaterial({ color: 0x00ff00 }), 
+                new THREE.MeshStandardMaterial({ color: 0x0000ff }), // Top
+                new THREE.MeshStandardMaterial({ color: 0xffff00 }), // Bottom
+                new THREE.MeshStandardMaterial({ color: 0xff00ff }), 
+                new THREE.MeshStandardMaterial({ color: 0x00ffff })  
+            ];
+            
+            const mesh = new THREE.Mesh(geo, materials);
+            scene.add(mesh);
+
+            const bodyDesc = RAPIER.RigidBodyDesc.dynamic().setTranslation(x, y, z);
+            const body = world.createRigidBody(bodyDesc);
+            const colliderDesc = RAPIER.ColliderDesc.cuboid(size/2, size/2, size/2)
+                .setRestitution(0.6).setFriction(0.5);
+                
+            world.createCollider(colliderDesc, body);
+            
+            body.enableCcd(true);
+            const inverseQuat = mesh.quaternion.clone().invert();
+            const localUp = new THREE.Vector3(0, 1, 0).applyQuaternion(inverseQuat).normalize();
+
+            interactables.push({ mesh: mesh, body: body, localUp: localUp, defaultLinDamp: 0.0, defaultAngDamp: 0.0 });
+        }
+
+        function spawnWeightedCone(x, y, z) {
+            const radius = 0.05;
+            const height = 0.3; 
+            const geo = new THREE.ConeGeometry(radius, height, 16);
+            const mat = new THREE.MeshStandardMaterial({ color: 0xff8800, roughness: 0.4 });
+            const mesh = new THREE.Mesh(geo, mat);
+            scene.add(mesh);
+
+            const bodyDesc = RAPIER.RigidBodyDesc.dynamic().setTranslation(x, y, z);
+            const body = world.createRigidBody(bodyDesc);
+            
+            const mainCollider = RAPIER.ColliderDesc.cone(height / 2, radius)
+                .setMass(0.5).setFriction(0.8);
+            world.createCollider(mainCollider, body);
+            
+            const baseRadius = radius * 2.0; 
+            const baseCollider = RAPIER.ColliderDesc.cylinder(0.01, baseRadius)
+                .setTranslation(0, -height / 2, 0) 
+                .setMass(10.0); 
+                
+            world.createCollider(baseCollider, body);
+
+            // Prevent eternal rolling for the cone
+            body.setAngularDamping(4.0);
+            body.setLinearDamping(0.5);
+
+            body.enableCcd(true);
+            const inverseQuat = mesh.quaternion.clone().invert();
+            const localUp = new THREE.Vector3(0, 1, 0).applyQuaternion(inverseQuat).normalize();
+
+            interactables.push({ mesh: mesh, body: body, localUp: localUp, defaultLinDamp: 0.5, defaultAngDamp: 4.0 });
+        }
+
+        function spawnWeebleDuck(x, y, z) {
+            const loader = new GLTFLoader();
+            loader.load('https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/Duck/glTF-Binary/Duck.glb', (gltf) => {
+                const mesh = gltf.scene;
+                mesh.scale.set(0.05, 0.05, 0.05);
+                scene.add(mesh);
+                setTimeout(() => buildConvexHullForMesh(mesh, x, y, z, true), 100);
+            });
+        }
+
+        function spawnAnimatedGLTF(x, y, z) {
+            const loader = new GLTFLoader();
+            loader.load('https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/Fox/glTF-Binary/Fox.glb', (gltf) => {
+                const mesh = gltf.scene;
+                mesh.scale.set(0.002, 0.002, 0.002);
+                
+                if (gltf.animations && gltf.animations.length > 0) {
+                    const mixer = new THREE.AnimationMixer(mesh);
+                    mixer.clipAction(gltf.animations[2] || gltf.animations[0]).play();
+                    animationMixers.push(mixer);
+                }
+                scene.add(mesh);
+                setTimeout(() => buildConvexHullForMesh(mesh, x, y, z), 100);
+            });
+        }
+
+        function spawnAnimatedFBX(x, y, z) {
+            const loader = new FBXLoader();
+            loader.load('https://raw.githubusercontent.com/mrdoob/three.js/master/examples/models/fbx/Samba%20Dancing.fbx', (fbx) => {
+                fbx.scale.set(0.0015, 0.0015, 0.0015);
+                
+                if (fbx.animations && fbx.animations.length > 0) {
+                    const mixer = new THREE.AnimationMixer(fbx);
+                    mixer.clipAction(fbx.animations[0]).play();
+                    animationMixers.push(mixer);
+                }
+                scene.add(fbx);
+                setTimeout(() => buildConvexHullForMesh(fbx, x, y, z), 100);
+            });
+        }
+
+        function handleInput() {
+            const session = renderer.xr.getSession();
+            if (!session) return;
+
+            let currentRightThumbstick = false;
+            let currentRightTrigger = false;
+            
+            session.inputSources.forEach((source) => {
+                if (source.gamepad && source.handedness === 'right') {
+                    if (source.gamepad.buttons[3] && source.gamepad.buttons[3].pressed) {
+                        currentRightThumbstick = true;
+                    }
+                    if (source.gamepad.buttons[0] && source.gamepad.buttons[0].pressed) {
+                        currentRightTrigger = true;
+                    }
+                }
+            });
+
+            if (currentRightThumbstick && !rightThumbstickPressed) {
+                currentModeIndex = (currentModeIndex + 1) % MODES.length;
+                
+                const textStr = MODES[currentModeIndex].text;
+                document.getElementById('mode-text').innerText = textStr;
+                document.getElementById('mode-text').style.color = '#00ffcc';
+                setTimeout(() => { document.getElementById('mode-text').style.color = '#fff'; }, 300);
+
+                updateVRUI(textStr);
+            }
+            rightThumbstickPressed = currentRightThumbstick;
+
+            if (currentRightTrigger && !rightTriggerPressed) {
+                hullsVisible = !hullsVisible;
+                debugLines.visible = hullsVisible;
+            }
+            rightTriggerPressed = currentRightTrigger;
+        }
+
+        function render() {
+            const dt = Math.min(clock.getDelta(), 0.1); 
+
+            handleInput();
+
+            const mode = MODES[currentModeIndex];
+
+            for (let hand of hands) {
+                const currentPos = new THREE.Vector3();
+                const currentQuat = new THREE.Quaternion();
+                
+                hand.grip.getWorldPosition(currentPos);
+                hand.grip.getWorldQuaternion(currentQuat);
+
+                if (dt > 0) {
+                    const instantVel = new THREE.Vector3().subVectors(currentPos, hand.prevPos).divideScalar(dt);
+                    hand.velocity.lerp(instantVel, 0.2); 
+                }
+                hand.prevPos.copy(currentPos);
+
+                if (hand.grabbedItem) {
+                    const targetPos = new THREE.Vector3();
+                    const targetQuat = new THREE.Quaternion();
+                    const targetScale = new THREE.Vector3();
+
+                    const targetMatrix = new THREE.Matrix4().copy(hand.grip.matrixWorld).multiply(hand.offsetMatrix);
+                    targetMatrix.decompose(targetPos, targetQuat, targetScale);
+
+                    hand.grabbedItem.body.setNextKinematicTranslation(targetPos);
+                    hand.grabbedItem.body.setNextKinematicRotation(targetQuat);
+                }
+            }
+
+            for (let item of interactables) {
+                if (item.body.bodyType() === RAPIER.RigidBodyType.Dynamic) {
+                    
+                    const vel = item.body.linvel();
+                    const speed = Math.sqrt(vel.x*vel.x + vel.y*vel.y + vel.z*vel.z);
+                    const MAX_SPEED = 8.0; 
+                    
+                    if (speed > MAX_SPEED) {
+                        item.body.setLinvel({
+                            x: (vel.x / speed) * MAX_SPEED,
+                            y: (vel.y / speed) * MAX_SPEED,
+                            z: (vel.z / speed) * MAX_SPEED
+                        }, true);
+                    }
+
+                    if (mode.throw === 'righting') {
+                        if (item.localUp) {
+                            const currentUp = item.localUp.clone().applyQuaternion(item.mesh.quaternion);
+                            const globalUp = new THREE.Vector3(0, 1, 0); 
+                            
+                            const angle = currentUp.angleTo(globalUp);
+                            
+                            if (angle > 0.05) {
+                                item.body.wakeUp();
+
+                                const correctionAxis = new THREE.Vector3().crossVectors(currentUp, globalUp).normalize();
+                                const correctionSpeed = 15.0; 
+                                
+                                item.body.setAngvel({ 
+                                    x: correctionAxis.x * angle * correctionSpeed, 
+                                    y: correctionAxis.y * angle * correctionSpeed, 
+                                    z: correctionAxis.z * angle * correctionSpeed 
+                                }, true);
+                            }
+                        }
+                    }
+                }
+            }
+
+            world.step();
+
+            if (hullsVisible) {
+                const { vertices, colors } = world.debugRender();
+                debugLines.geometry.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
+                debugLines.geometry.setAttribute('color', new THREE.BufferAttribute(colors, 4));
+            }
+
+            for (let item of interactables) {
+                const position = item.body.translation();
+                const rotation = item.body.rotation();
+                
+                item.mesh.position.set(position.x, position.y, position.z);
+                item.mesh.quaternion.set(rotation.x, rotation.y, rotation.z, rotation.w);
+            }
+
+            for (let mixer of animationMixers) {
+                mixer.update(dt);
+            }
+
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>

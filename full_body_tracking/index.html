@@ -1,0 +1,808 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Quest 3 MR - Pinned Posture Sync, Balls and Calibration</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; color: white; font-family: sans-serif; }
+        
+        #info { 
+            position: absolute; top: 15px; left: 15px; z-index: 100; 
+            background: #111; padding: 15px 20px; border-radius: 12px;
+            width: 440px; border: 2px solid #00ffcc; box-sizing: border-box;
+        }
+        h1 { margin: 0 0 5px 0; font-size: 18px; color: #00ffcc; text-transform: uppercase; }
+        h4 { margin: 10px 0 5px 0; color: #aaa; font-size: 12px; text-transform: uppercase; border-bottom: 1px solid #333; padding-bottom: 4px; }
+        p { margin: 0 0 10px 0; line-height: 1.3; font-size: 12px; color: #eee; }
+        .highlight { color: #ffaa00; font-weight: bold; }
+
+        .control-group { background: #222; padding: 8px; border-radius: 6px; margin-bottom: 6px;}
+        .control-group > label { display: block; margin-bottom: 4px; color: #00ffcc; font-weight: bold; font-size: 11px;}
+        input[type="range"] { width: 100%; cursor: pointer; height: 12px; }
+        
+        .tab-row { display: flex; gap: 5px; margin-bottom: 8px; }
+        .tab-btn { flex: 1; background: #333; color: #aaa; padding: 6px 2px; font-size: 11px; margin: 0; border: 1px solid #555; border-radius: 4px; cursor: pointer; }
+        .tab-btn.active { background: #00ffcc; color: #000; border-color: #00ffcc; font-weight: bold; }
+
+        .xyz-row { display: flex; gap: 8px; }
+        .xyz-col { flex: 1; display: flex; flex-direction: column; }
+        .xyz-col label { font-size: 10px; margin-bottom: 2px; color: #ddd; }
+
+        .action-row { display: flex; gap: 8px; margin-top: 10px; }
+        button { background: #00ffcc; color: #111; border: none; padding: 8px; font-size: 12px; font-weight: bold; border-radius: 6px; cursor: pointer; width: 100%; }
+        button:hover { background: #00cca3; }
+
+        .checkbox-group { display: flex; align-items: center; background: #003322; border: 1px solid #00ffcc; padding: 6px; border-radius: 6px; margin-bottom: 6px;}
+        .checkbox-group input { margin-right: 8px; width: 16px; height: 16px; }
+        .checkbox-group label { font-size: 11px; color: #00ffcc; font-weight: bold; }
+
+        #status { font-size: 12px; color: #111; margin-top: 5px; font-weight: bold; text-align: center; padding: 8px; border-radius: 6px; background: #ffaa00; }
+        .status-ready { background: #00ffcc !important; }
+
+        #dashboard {
+            position: absolute; top: 15px; right: 15px; z-index: 100;
+            background: #111; padding: 20px; border-radius: 12px;
+            font-family: monospace; font-size: 12px; color: #0f0; width: 440px; min-height: 350px; border: 2px solid #333; box-sizing: border-box;
+        }
+        .dash-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #00ffcc; padding-bottom: 8px; margin-bottom: 8px; }
+        .posture-badge { background: #ffaa00; color: #000; padding: 2px 8px; border-radius: 12px; font-weight: bold; font-size: 11px; }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { border-bottom: 1px solid #333; padding: 6px; text-align: left; }
+        th { color: #0ff; font-size: 13px;}
+        .offline { color: #f55 !important; }
+        
+        #fileInput { display: none; }
+    </style>
+</head>
+<body>
+    <div id="info">
+        <h1>Pinned Posture Sync</h1>
+        <p>Sit or stand straight, look forward. Press <span class="highlight">'A' Button</span> to explicitly pin origin.</p>
+        
+        <button id="swapFeetBtn" style="background:#ffaa00; margin-bottom: 5px;">Swap L/R Feet Assignment</button>
+        <button id="spawnBallBtn" style="background:#ff3366; color:white; margin-bottom: 5px;">Spawn Kickable MR Ball</button>
+
+        <div class="checkbox-group">
+            <input type="checkbox" id="antiDrift" checked>
+            <label for="antiDrift">Soft-Touch Leash (Gently pulls hips if SLAM drifts)</label>
+        </div>
+
+        <div class="checkbox-group" style="background: #002233; border-color: #00ccff;">
+            <input type="checkbox" id="allowAirkicks" checked>
+            <label for="allowAirkicks" style="color: #00ccff;">Allow Ball Air-Kicks (Strike from beneath)</label>
+        </div>
+
+        <h4>Global Universe Offset</h4>
+        <div class="control-group">
+            <div class="xyz-row">
+                <div class="xyz-col"><label>Yaw: <span id="yawVal">0</span>°</label><input type="range" id="yawSlider" min="-45" max="45" step="1" value="0"></div>
+                <div class="xyz-col"><label>X: <span id="gXVal">0.00</span>m</label><input type="range" id="gXSlider" min="-1.0" max="1.0" step="0.01" value="0.00"></div>
+                <div class="xyz-col"><label>Y: <span id="gYVal">-0.75</span>m</label><input type="range" id="gYSlider" min="-2.0" max="2.0" step="0.01" value="-0.75"></div>
+                <div class="xyz-col"><label>Z: <span id="gZVal">0.00</span>m</label><input type="range" id="gZSlider" min="-1.0" max="1.0" step="0.01" value="0.00"></div>
+            </div>
+        </div>
+
+        <h4>Individual Tracker Offset</h4>
+        <div class="control-group">
+            <div class="tab-row" id="offsetTabs">
+                <button class="tab-btn active" data-target="hips">Hips</button>
+                <button class="tab-btn" data-target="leftFoot">L-Foot</button>
+                <button class="tab-btn" data-target="rightFoot">R-Foot</button>
+                <button class="tab-btn" data-target="chest">Chest</button>
+            </div>
+            <div class="xyz-row">
+                <div class="xyz-col"><label>Local X: <span id="lXVal">0.00</span></label><input type="range" id="lXSlider" min="-0.5" max="0.5" step="0.01" value="0.00"></div>
+                <div class="xyz-col"><label>Local Y: <span id="lYVal">0.00</span></label><input type="range" id="lYSlider" min="-0.5" max="0.5" step="0.01" value="0.00"></div>
+                <div class="xyz-col"><label>Local Z: <span id="lZVal">0.00</span></label><input type="range" id="lZSlider" min="-0.5" max="0.5" step="0.01" value="0.00"></div>
+            </div>
+        </div>
+
+        <h4>System & UI</h4>
+        <div class="control-group">
+            <div class="xyz-row">
+                <div class="xyz-col" style="flex:2;"><label>UI Height: <span id="uiHVal">0.80</span>m</label><input type="range" id="uiHSlider" min="0.2" max="2.0" step="0.05" value="0.90"></div>
+                <div class="xyz-col"><label>Scale X: <span id="pXVal">1.0</span></label><input type="range" id="pXSlider" min="0.1" max="3.0" step="0.1" value="1.0"></div>
+                <div class="xyz-col"><label>Scale Y: <span id="pYVal">1.0</span></label><input type="range" id="pYSlider" min="0.1" max="3.0" step="0.1" value="1.0"></div>
+                <div class="xyz-col"><label>Scale Z: <span id="pZVal">1.0</span></label><input type="range" id="pZSlider" min="0.1" max="3.0" step="0.1" value="1.0"></div>
+            </div>
+        </div>
+
+        <div class="action-row">
+            <button id="exportBtn">Export JSON (Desktop)</button>
+            <button id="importBtn" style="background:#ddd;">Import JSON (Desktop)</button>
+            <input type="file" id="fileInput" accept=".json">
+        </div>
+
+        <div id="status">Waiting for Trackers...</div>
+    </div>
+
+    <div id="dashboard">
+        <div class="dash-header">
+            <span style="font-size: 16px; font-weight: bold; color: #00ffcc;">TELEMETRY</span>
+            <span id="postureBadge" class="posture-badge">DETECTING...</span>
+        </div>
+        <table>
+            <thead><tr><th>Role</th><th>ID</th><th>Status</th><th>Pos (X,Y,Z)</th></tr></thead>
+            <tbody id="dashBody"></tbody>
+        </table>
+    </div>
+
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+            "@dimforge/rapier3d-compat": "https://unpkg.com/@dimforge/rapier3d-compat@0.13.1/rapier.es.js"
+        }
+    }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+        import { HTMLMesh } from 'three/addons/interactive/HTMLMesh.js';
+        import { InteractiveGroup } from 'three/addons/interactive/InteractiveGroup.js';
+        import RAPIER from '@dimforge/rapier3d-compat';
+
+        let scene, camera, renderer, world, clock = new THREE.Clock();
+        
+        // --- MASTER STATE & CONFIG ---
+        const spaceCalib = { 
+            steamVR_XZ: new THREE.Vector2(), webXR_XZ: new THREE.Vector2(),
+            yawOffset: 0, isCalibrated: false, wakeTimer: null,
+            lastCameraPos: new THREE.Vector3(), hasInitializedCamera: false // Added for 'soft wake' jump detection
+        };
+
+        let config = {
+            antiDrift: true,
+            manualYaw: 0,
+            globalOffset: { x: 0, y: -0.75, z: 0 },
+            roleOffsets: {
+                leftFoot: {x:0,y:0,z:0}, rightFoot: {x:0,y:0,z:0},
+                hips: {x:0,y:0,z:0}, chest: {x:0,y:0,z:0}
+            },
+            swapFeet: false,
+            uiHeight: 0.90,
+            puckScale: { x: 1, y: 1, z: 1 },
+            showTrackers: true,
+            trackerColliders: { 
+                leftFoot: true,
+                rightFoot: true,
+                hips: false, 
+                chest: false 
+            },
+            allowAirkicks: true
+        };
+
+        const rawTrackers = {};
+        const roles = { leftFoot: null, rightFoot: null, hips: null, chest: null };
+
+        let controllerLeft, controllerRight, rCtrlActive = false;
+        let meshes = {}, bodies = {}, colliders = {}, dashboardRows = {};
+        let infoMesh, dashMesh;
+        let aButtonLastState = false;
+        let currentOffsetTarget = 'hips';
+        let isSeated = false;
+        let wakeCooldown = 0; // Tracks post-wake stabilization timer
+        
+        const WS_PORT = 8089; 
+
+
+        let physicsBalls = [];
+        const ballMaterial = { restitution: 0.7, friction: 0.4 };
+
+
+        // --- PERSISTENCE LOGIC ---
+        function saveConfig() { localStorage.setItem('trackerConfig', JSON.stringify(config)); }
+
+        function loadConfig() {
+            const saved = localStorage.getItem('trackerConfig');
+            if (saved) {
+                try { config = { ...config, ...JSON.parse(saved) }; } 
+                catch (e) { console.error("Corrupted local config"); }
+            }
+            updateUIFromConfig();
+        }
+
+        function updateUIFromConfig() {
+            document.getElementById('antiDrift').checked = config.antiDrift;
+            document.getElementById('yawSlider').value = THREE.MathUtils.radToDeg(config.manualYaw);
+            document.getElementById('yawVal').innerText = THREE.MathUtils.radToDeg(config.manualYaw).toFixed(0);
+
+            document.getElementById('allowAirkicks').addEventListener('change', (e) => { config.allowAirkicks = e.target.checked; saveConfig(); });
+            document.getElementById('allowAirkicks').checked = config.allowAirkicks;
+
+            ['X', 'Y', 'Z'].forEach(axis => {
+                const ax = axis.toLowerCase();
+                document.getElementById(`g${axis}Slider`).value = config.globalOffset[ax];
+                document.getElementById(`g${axis}Val`).innerText = config.globalOffset[ax].toFixed(2);
+                
+                const off = config.roleOffsets[currentOffsetTarget];
+                document.getElementById(`l${axis}Slider`).value = off[ax];
+                document.getElementById(`l${axis}Val`).innerText = off[ax].toFixed(2);
+
+                document.getElementById(`p${axis}Slider`).value = config.puckScale[ax];
+                document.getElementById(`p${axis}Val`).innerText = config.puckScale[ax].toFixed(1);
+            });
+
+            document.getElementById('uiHSlider').value = config.uiHeight;
+            document.getElementById('uiHVal').innerText = config.uiHeight.toFixed(2);
+
+            updateMeshScales();
+            if (infoMesh) infoMesh.position.y = config.uiHeight;
+            if (dashMesh) dashMesh.position.y = config.uiHeight;
+        }
+
+        function updateMeshScales() {
+            ['leftFoot', 'rightFoot', 'hips', 'chest'].forEach(k => {
+                if(meshes[k]) meshes[k].scale.set(config.puckScale.x, config.puckScale.y, config.puckScale.z);
+            });
+        }
+
+        function updateStatus(msg, isReady = false) {
+            const el = document.getElementById('status');
+            el.innerText = msg;
+            if (isReady) el.classList.add('status-ready');
+            else el.classList.remove('status-ready');
+        }
+
+        function initDashboard() {
+            const tbody = document.getElementById('dashBody');
+            ['headset', 'ctrlR', 'leftFoot', 'rightFoot', 'hips', 'chest'].forEach(k => {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `<td>${k.toUpperCase()}</td><td id="id-${k}">-</td><td id="stat-${k}" class="offline">Offline</td><td id="pos-${k}">-</td>`;
+                tbody.appendChild(tr);
+                dashboardRows[k] = { id: document.getElementById(`id-${k}`), stat: document.getElementById(`stat-${k}`), pos: document.getElementById(`pos-${k}`) };
+            });
+        }
+
+        function updateDashRow(key, data, calibPos) {
+            const row = dashboardRows[key];
+            if (!data) { 
+                row.id.innerText = '-'; row.stat.innerText = 'Offline'; row.stat.className = 'offline'; 
+                return; 
+            }
+            row.id.innerText = data.id || 'Quest Native';
+            row.stat.innerText = 'Active'; row.stat.className = '';
+            if (calibPos) row.pos.innerText = `${calibPos.x.toFixed(2)}, ${calibPos.y.toFixed(2)}, ${calibPos.z.toFixed(2)}`;
+        }
+
+        function initWebSocket() {
+            try {
+                const ws = new WebSocket(`ws://localhost:${WS_PORT}`);
+                ws.onmessage = (e) => {
+                    const d = JSON.parse(e.data);
+                    const t = clock.getElapsedTime();
+                    for (const [id, data] of Object.entries(d)) {
+                        if (!rawTrackers[id]) rawTrackers[id] = { id: id, pos: new THREE.Vector3(), quat: new THREE.Quaternion() };
+                        rawTrackers[id].pos.set(data.pos.x, data.pos.y, data.pos.z);
+                        rawTrackers[id].quat.set(data.rot.x, data.rot.y, data.rot.z, data.rot.w);
+                        rawTrackers[id].lastUpdate = t;
+                    }
+                };
+                ws.onclose = () => setTimeout(initWebSocket, 2000);
+            } catch (err) { setTimeout(initWebSocket, 2000); }
+        }
+
+        function createPuck(color) {
+            const grp = new THREE.Group();
+            const mesh = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.025, 0.019, 16), new THREE.MeshBasicMaterial({color: color, wireframe: true}));
+            mesh.rotation.x = Math.PI/2;
+            grp.add(mesh);
+            grp.add(new THREE.AxesHelper(0.075)); 
+            return grp;
+        }
+
+        async function init() {
+            initDashboard();
+            loadConfig(); 
+
+            await RAPIER.init();
+            world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
+
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth/window.innerHeight, 0.01, 20);
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.xr.addEventListener('sessionstart', () => {
+                const session = renderer.xr.getSession();
+
+                session.addEventListener('visibilitychange', () => {
+                    if (session.visibilityState === 'visible') {
+                        console.log("Headset woke up. Waiting 3.5s for user to settle & look forward...");
+                        
+                        // Clear any existing pending timer
+                        if (spaceCalib.wakeTimer) clearTimeout(spaceCalib.wakeTimer);
+
+                        // Force UI warning
+                        updateStatus("Headset Waking... Look straight ahead!", false);
+
+                        // 3.5 Second Delay to ensure headset is on head and pointing forward
+                        spaceCalib.wakeTimer = setTimeout(() => {
+                            if (roles.hips) {
+                                executeAnatomicalCalibration();
+                                console.log("Delayed post-wake auto-calibration executed.");
+                            }
+                            spaceCalib.wakeTimer = null;
+                        }, 3500);
+                    }
+                });
+            });
+            renderer.xr.enabled = true;
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.body.appendChild(renderer.domElement);
+            document.body.appendChild(ARButton.createButton(renderer, { requiredFeatures: ['local-floor'] }));
+            scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 3));
+
+            const laserGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(0,0,-2)]);
+            const laserMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.5 });
+            const laserMesh = new THREE.Line(laserGeo, laserMat);
+
+            controllerLeft = renderer.xr.getController(0);
+            controllerLeft.addEventListener('selectstart', onFireBall);
+            controllerLeft.add(laserMesh.clone());
+            scene.add(controllerLeft);
+
+            controllerRight = renderer.xr.getController(1);
+            controllerRight.addEventListener('connected', () => rCtrlActive = true);
+            controllerRight.addEventListener('disconnected', () => rCtrlActive = false);
+            controllerRight.add(laserMesh.clone());
+            scene.add(controllerRight);
+
+            const interactiveGroup = new InteractiveGroup(renderer, camera);
+            scene.add(interactiveGroup);
+            
+            infoMesh = new HTMLMesh(document.getElementById('info'));
+            infoMesh.position.set(-0.35, config.uiHeight, -0.6); 
+            infoMesh.rotation.y = Math.PI / 8; infoMesh.scale.setScalar(1.6);
+            interactiveGroup.add(infoMesh);
+            
+            dashMesh = new HTMLMesh(document.getElementById('dashboard'));
+            dashMesh.position.set(0.4, config.uiHeight, -0.6); 
+            dashMesh.rotation.y = -Math.PI / 8; dashMesh.scale.setScalar(1.6);
+            interactiveGroup.add(dashMesh);
+
+            // UI EVENTS
+            document.getElementById('antiDrift').addEventListener('change', (e) => { config.antiDrift = e.target.checked; saveConfig(); });
+            document.getElementById('swapFeetBtn').addEventListener('click', () => { config.swapFeet = !config.swapFeet; saveConfig(); });
+            document.getElementById('spawnBallBtn').addEventListener('click', spawnKickableBall);
+
+            document.getElementById('yawSlider').addEventListener('input', (e) => {
+                config.manualYaw = THREE.MathUtils.degToRad(parseFloat(e.target.value));
+                document.getElementById('yawVal').innerText = e.target.value;
+            });
+            document.getElementById('yawSlider').addEventListener('change', saveConfig);
+
+            ['X', 'Y', 'Z'].forEach(axis => {
+                const ax = axis.toLowerCase();
+                const gSlider = document.getElementById(`g${axis}Slider`);
+                gSlider.addEventListener('input', (e) => {
+                    config.globalOffset[ax] = parseFloat(e.target.value);
+                    document.getElementById(`g${axis}Val`).innerText = config.globalOffset[ax].toFixed(2);
+                });
+                gSlider.addEventListener('change', saveConfig);
+
+                const lSlider = document.getElementById(`l${axis}Slider`);
+                lSlider.addEventListener('input', (e) => {
+                    config.roleOffsets[currentOffsetTarget][ax] = parseFloat(e.target.value);
+                    document.getElementById(`l${axis}Val`).innerText = config.roleOffsets[currentOffsetTarget][ax].toFixed(2);
+                });
+                lSlider.addEventListener('change', saveConfig);
+
+                const pSlider = document.getElementById(`p${axis}Slider`);
+                pSlider.addEventListener('input', (e) => {
+                    config.puckScale[ax] = parseFloat(e.target.value);
+                    document.getElementById(`p${axis}Val`).innerText = config.puckScale[ax].toFixed(1);
+                    updateMeshScales();
+                });
+                pSlider.addEventListener('change', saveConfig);
+            });
+
+            document.getElementById('uiHSlider').addEventListener('input', (e) => {
+                config.uiHeight = parseFloat(e.target.value);
+                document.getElementById('uiHVal').innerText = config.uiHeight.toFixed(2);
+                infoMesh.position.y = config.uiHeight; dashMesh.position.y = config.uiHeight;
+            });
+            document.getElementById('uiHSlider').addEventListener('change', saveConfig);
+
+            document.querySelectorAll('.tab-btn').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+                    e.target.classList.add('active');
+                    currentOffsetTarget = e.target.getAttribute('data-target');
+                    updateUIFromConfig();
+                });
+            });
+
+            document.getElementById('exportBtn').addEventListener('click', () => {
+                const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(config));
+                const dl = document.createElement('a');
+                dl.setAttribute("href", dataStr); dl.setAttribute("download", "tracker_config.json");
+                dl.click();
+            });
+
+            document.getElementById('importBtn').addEventListener('click', () => document.getElementById('fileInput').click());
+            document.getElementById('fileInput').addEventListener('change', (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                const reader = new FileReader();
+                reader.onload = (ev) => {
+                    try { config = { ...config, ...JSON.parse(ev.target.result) }; saveConfig(); updateUIFromConfig(); } 
+                    catch(err) { alert("Invalid JSON file"); }
+                };
+                reader.readAsText(file);
+            });
+
+            const colors = { leftFoot: 0xff0055, rightFoot: 0x0055ff, hips: 0x00ffcc, chest: 0xccff00 };
+            ['leftFoot', 'rightFoot', 'hips', 'chest'].forEach(k => {
+                meshes[k] = createPuck(colors[k]); scene.add(meshes[k]);
+                const rbDesc = RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(0, -10, 0);
+                bodies[k] = world.createRigidBody(rbDesc);
+                colliders[k] = world.createCollider(RAPIER.ColliderDesc.cuboid(0.05, 0.03, 0.09), bodies[k]);
+            });
+
+            updateMeshScales();
+            initWebSocket();
+            renderer.setAnimationLoop(render);
+        }
+
+        // --- HIP-CENTRIC EXPLICIT CALIBRATION ---
+        function executeAnatomicalCalibration() {
+            if (!roles.hips) {
+                updateStatus("Failed: Hips Tracker is required for anchor.", false);
+                return;
+            }
+
+            // 1. PIN THE ROTATION (Strictly explicit from Hip tracker orientation)
+            const s_fwd = new THREE.Vector3(0,0,-1).applyQuaternion(roles.hips.quat).setY(0).normalize();
+            
+            // 2. PIN THE POSITION (Center directly under Hips)
+            const s_center = new THREE.Vector2(roles.hips.pos.x, roles.hips.pos.z);
+
+            const w_fwd = new THREE.Vector3();
+            camera.getWorldDirection(w_fwd);
+            w_fwd.setY(0).normalize(); 
+
+            const s_yaw = Math.atan2(s_fwd.x, s_fwd.z);
+            const w_yaw = Math.atan2(w_fwd.x, w_fwd.z);
+            
+            spaceCalib.yawOffset = w_yaw - s_yaw;
+            spaceCalib.steamVR_XZ.copy(s_center);
+            spaceCalib.webXR_XZ.set(camera.position.x, camera.position.z);
+            
+            spaceCalib.isCalibrated = true;
+
+            // Find the lowest active foot tracker position (or any active tracker) to accurately determine floor height
+            let lowestY = camera.position.y - 1.0; // Fallback
+            ['leftFoot', 'rightFoot', 'hips', 'chest'].forEach(k => {
+                if (roles[k] && rawTrackers[roles[k].id]) {
+                    const rawY = rawTrackers[roles[k].id].pos.y;
+                    if (rawY < lowestY) lowestY = rawY;
+                }
+            });
+
+            // Calibrate floor, adjustable, below the lowest active tracker after applying transform
+            const calibratedFootTrans = getCalibratedTransform(new THREE.Vector3(0, lowestY, 0), new THREE.Quaternion(), 'leftFoot', true);
+            const floorHeightAdjustment = 0.45 // TODO put on a slider
+            const floorY = calibratedFootTrans.pos.y + floorHeightAdjustment;
+
+            spawnKnownFloorPlane(camera.position.x, floorY, camera.position.z, 4.0, 4.0);
+        }
+
+        function getCalibratedTransform(rawPos, rawQuat, roleKey) {
+            if (!spaceCalib.isCalibrated) return { pos: rawPos.clone(), quat: rawQuat.clone() };
+
+            const finalPos = rawPos.clone();
+            const finalQuat = rawQuat.clone();
+
+            finalPos.x -= spaceCalib.steamVR_XZ.x;
+            finalPos.z -= spaceCalib.steamVR_XZ.y;
+
+            const totalYaw = spaceCalib.yawOffset + config.manualYaw;
+            const yawQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), totalYaw);
+            
+            finalPos.applyQuaternion(yawQuat);
+            finalQuat.premultiply(yawQuat);
+
+            const localOff = config.roleOffsets[roleKey];
+            finalPos.x += localOff.x; finalPos.y += localOff.y; finalPos.z += localOff.z;
+
+            finalPos.x += spaceCalib.webXR_XZ.x;
+            finalPos.z += spaceCalib.webXR_XZ.y;
+
+            finalPos.x += config.globalOffset.x;
+            finalPos.y += config.globalOffset.y;
+            finalPos.z += config.globalOffset.z;
+
+            return { pos: finalPos, quat: finalQuat };
+        }
+
+        // --- STRICT SOFT-TOUCH TETHER ---
+        function runAntiDrift() {
+            if (!config.antiDrift || !spaceCalib.isCalibrated || !roles.hips) return;
+
+            const hipsCalib = getCalibratedTransform(roles.hips.pos, roles.hips.quat, 'hips').pos;
+            
+            // Posture Detection
+            const verticalDist = camera.position.y - hipsCalib.y;
+            isSeated = verticalDist < 0.60;
+            const badge = document.getElementById('postureBadge');
+            badge.innerText = isSeated ? "SEATED" : "STANDING";
+            badge.style.background = isSeated ? "#00ccff" : "#ffaa00";
+
+            // Tighter radii to keep pucks strictly pinned to the body
+            const leashRadius = isSeated ? 0.40 : 0.12; 
+
+            // X/Z distances from Headset to Calibrated Hips
+            const dx = camera.position.x - hipsCalib.x;
+            const dz = camera.position.z - hipsCalib.z;
+            const dist = Math.sqrt(dx*dx + dz*dz);
+            
+            if (dist > leashRadius) {
+                // Ultra-gentle pull strength (0.001) prevents any rubber-banding artifact
+                const pullStrength = 0.001; 
+                spaceCalib.webXR_XZ.x += dx * pullStrength;
+                spaceCalib.webXR_XZ.y += dz * pullStrength; 
+            }
+        }
+
+        function onFireBall() {
+            const ballMesh = new THREE.Mesh(new THREE.SphereGeometry(0.04, 16, 16), new THREE.MeshStandardMaterial({ color: 0x33ff66, roughness: 0.2 }));
+            scene.add(ballMesh);
+            const rigidBody = world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(camera.position.x, camera.position.y - 0.2, camera.position.z));
+            world.createCollider(RAPIER.ColliderDesc.ball(0.04).setRestitution(0.7), rigidBody);
+            rigidBody.setLinvel(new THREE.Vector3(0, 0, -8).applyQuaternion(camera.quaternion), true);
+            physicsBalls.push({ mesh: ballMesh, body: rigidBody });
+        }
+
+        function pollControllerInput(frame) {
+            if (!frame || !frame.session) return;
+            let isPressedNow = false;
+            for (const source of frame.session.inputSources) {
+                if (source.handedness === 'right' && source.gamepad && source.gamepad.buttons[4]?.pressed) {
+                    isPressedNow = true;
+                }
+            }
+            // Only allow manual 'A' button reset if wake cooldown has finished
+            if (isPressedNow && !aButtonLastState && wakeCooldown <= 0) {
+                executeAnatomicalCalibration();
+            }
+            aButtonLastState = isPressedNow;
+        }
+
+        function render(time, frame) {
+            const t = clock.getElapsedTime();
+            const dt = clock.getDelta();
+
+            // --- PROXIMITY WAKE DETECTION (Triggers when putting headset back on) ---
+            if (spaceCalib.isCalibrated) {
+                if (!spaceCalib.hasInitializedCamera) {
+                    spaceCalib.lastCameraPos.copy(camera.position);
+                    spaceCalib.hasInitializedCamera = true;
+                } else {
+                    const camJump = camera.position.distanceTo(spaceCalib.lastCameraPos);
+                    
+                    // If the camera instantly moves > 0.3m in a single frame, the user just 
+                    // put the headset back on or the Quest SLAM re-localized.
+                    if (camJump > 0.3 && !spaceCalib.wakeTimer) {
+                        console.log("Headset Proximity Wake Detected (Camera Jump: " + camJump.toFixed(2) + "m). Waiting 3.5s to settle...");
+                        
+                        updateStatus("Headset Waking... Look straight ahead!", false);
+                        document.getElementById('postureBadge').innerText = "WAKING...";
+                        document.getElementById('postureBadge').style.background = "#ff0000";
+
+                        // 3.5 Second Delay to ensure user is wearing it and looking forward
+                        spaceCalib.wakeTimer = setTimeout(() => {
+                            if (roles.hips) {
+                                executeAnatomicalCalibration();
+                                console.log("Delayed post-wake auto-calibration executed.");
+                            }
+                            spaceCalib.wakeTimer = null;
+                        }, 3500);
+                    }
+                    spaceCalib.lastCameraPos.copy(camera.position);
+                }
+            }
+
+            const active = Object.values(rawTrackers).filter(tr => (t - tr.lastUpdate) < 0.5);
+            active.sort((a, b) => a.pos.y - b.pos.y);
+            
+            roles.leftFoot = null; roles.rightFoot = null; roles.hips = null; roles.chest = null;
+            if (active.length >= 3) {
+                roles.leftFoot = config.swapFeet ? active[1] : active[0];
+                roles.rightFoot = config.swapFeet ? active[0] : active[1];
+                roles.hips = active[2];
+                if (active.length >= 4) roles.chest = active[3];
+                
+                // Only update status to ready if the 3.5s wake timer isn't currently counting down
+                if (!spaceCalib.wakeTimer) {
+                    updateStatus(spaceCalib.isCalibrated ? "Calibrated & Locked" : "Ready. Look forward & press 'A'.", true);
+                }
+            } else {
+                updateStatus("Waiting for 3+ Trackers (Feet + Hips)...", false);
+            }
+
+            pollControllerInput(frame);
+            
+            // Skip running anti-drift while the wake cooldown/timer is active
+            if (!spaceCalib.wakeTimer) {
+                runAntiDrift();
+            }
+
+            updateDashRow('headset', {id: 'Headset'}, camera.position);
+            updateDashRow('ctrlR', rCtrlActive ? {id: 'R-Ctrl'} : null, rCtrlActive ? controllerRight.position : null);
+
+            ['leftFoot', 'rightFoot', 'hips', 'chest'].forEach(k => {
+                if (colliders[k]) {
+                    colliders[k].setEnabled(config.trackerColliders[k]);
+                }
+
+                const tr = roles[k];
+                if (tr) {
+                    const trans = getCalibratedTransform(tr.pos, tr.quat, k);
+                    meshes[k].position.copy(trans.pos); 
+                    meshes[k].quaternion.copy(trans.quat); 
+                    meshes[k].visible = config.showTrackers;
+                    
+                    bodies[k].setTranslation(trans.pos, true); 
+                    bodies[k].setRotation(trans.quat, true);
+                    updateDashRow(k, tr, trans.pos);
+                } else {
+                    meshes[k].visible = false; 
+                    bodies[k].setTranslation({x:0, y:-10, z:0}, true);
+                    updateDashRow(k, null, null);
+                }
+            });
+
+            // --- ROBUST WEIGHTED PHYSICS BALL DIRECTIONAL & KICKING & AIR-KICK INTERACTION ---
+            physicsBalls.forEach(b => {
+                const p = b.body.translation();
+                const q = b.body.rotation();
+                
+                if (isNaN(p.x) || isNaN(p.y) || isNaN(p.z) || p.y < -2.0 || p.y > 5.0) {
+                    b.body.setTranslation({ x: camera.position.x, y: 0.5, z: camera.position.z - 1.0 }, true);
+                    b.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+                    b.body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+                    return;
+                }
+
+                b.mesh.position.set(p.x, p.y, p.z);
+                b.mesh.quaternion.set(q.x, q.y, q.z, q.w);
+
+                ['leftFoot', 'rightFoot'].forEach(footKey => {
+                    if (roles[footKey] && meshes[footKey].visible && config.trackerColliders[footKey]) {
+                        const footPos = meshes[footKey].position;
+                        const ballPos = new THREE.Vector3(p.x, p.y, p.z);
+                        const toFoot = new THREE.Vector3().subVectors(footPos, ballPos);
+                        const dist = toFoot.length();
+                        
+                        // Interaction threshold (shifted slightly to allow foot contact from beneath)
+                        if (dist < b.radius + 0.04) {
+                            const currentVel = b.body.linvel();
+                            const kickDir = new THREE.Vector3(p.x - footPos.x, 0.0, p.z - footPos.z);
+                            
+                            if (kickDir.lengthSq() > 0.0001) {
+                                kickDir.normalize();
+                                const kickStrength = 2.2; 
+
+                                // Calculate vertical lift based on foot position relative to ball center
+                                let upwardVelocity = Math.min(currentVel.y, 0.5); // Default grounded cap
+                                
+                                if (config.allowAirkicks) {
+                                    // If foot is striking from *beneath* the ball's center
+                                    const heightDiff = ballPos.y - footPos.y; 
+                                    if (heightDiff > -0.02) {
+                                        // Impart an upward pop proportional to how low the foot is striking from
+                                        upwardVelocity = Math.max(currentVel.y * 0.2 + (heightDiff * 14.0), 2.5);
+                                    }
+                                }
+
+                                b.body.setLinvel({
+                                    x: currentVel.x * 0.4 + (kickDir.x * kickStrength),
+                                    y: upwardVelocity,
+                                    z: currentVel.z * 0.4 + (kickDir.z * kickStrength)
+                                }, true);
+                            }
+                        }
+                    }
+                });
+
+                // Velocity Clamp
+                const currentVel = b.body.linvel();
+                const speedSq = currentVel.x * currentVel.x + currentVel.y * currentVel.y + currentVel.z * currentVel.z;
+                const maxSpeed = 6.5; 
+                if (speedSq > maxSpeed * maxSpeed) {
+                    const scale = maxSpeed / Math.sqrt(speedSq);
+                    b.body.setLinvel({
+                        x: currentVel.x * scale,
+                        y: currentVel.y * scale,
+                        z: currentVel.z * scale
+                    }, true);
+                }
+            });
+
+            // --- Go ---
+            world.step();
+            renderer.render(scene, camera);
+        }
+
+
+        // ---
+
+        let activeFloorMesh = null;
+        let activeFloorBody = null;
+
+        function spawnKnownFloorPlane(x, y, z, width, depth) {
+            // Remove previous grid mesh if it exists
+            if (activeFloorMesh) {
+                scene.remove(activeFloorMesh);
+                activeFloorMesh.geometry.dispose();
+                activeFloorMesh.material.dispose();
+                activeFloorMesh = null;
+            }
+            // Remove previous floor physics body if it exists
+            if (activeFloorBody) {
+                world.removeRigidBody(activeFloorBody);
+                activeFloorBody = null;
+            }
+
+            const planeGeo = new THREE.PlaneGeometry(width, depth);
+            const planeMat = new THREE.MeshBasicMaterial({ 
+                color: 0x00ffcc, 
+                transparent: true, 
+                opacity: 0.2, 
+                side: THREE.DoubleSide,
+                wireframe: true 
+            });
+            activeFloorMesh = new THREE.Mesh(planeGeo, planeMat);
+            activeFloorMesh.rotation.x = -Math.PI / 2; 
+            activeFloorMesh.position.set(x, y, z);
+            scene.add(activeFloorMesh);
+
+            const bodyDesc = RAPIER.RigidBodyDesc.fixed().setTranslation(x, y - 0.05, z);
+            activeFloorBody = world.createRigidBody(bodyDesc);
+            
+            const colliderDesc = RAPIER.ColliderDesc.cuboid(width / 2, 0.05, depth / 2)
+                .setRestitution(0.7)
+                .setFriction(0.5);
+            world.createCollider(colliderDesc, activeFloorBody);
+        }
+
+        function spawnKickableBall() {
+            const spawnPos = new THREE.Vector3(0, 0.2, -0.3).applyQuaternion(camera.quaternion);
+            spawnPos.y = 0.1; 
+
+            const ballGeo = new THREE.SphereGeometry(0.125, 32, 32);
+            const ballMat = new THREE.MeshStandardMaterial({ 
+                color: 0xff3366, 
+                roughness: 0.3, 
+                metalness: 0.2
+            });
+            const ballMesh = new THREE.Mesh(ballGeo, ballMat);
+            scene.add(ballMesh);
+
+            // Heavier physics properties: higher mass, more linear drag, higher angular resistance
+            const bodyDesc = RAPIER.RigidBodyDesc.dynamic()
+                .setTranslation(spawnPos.x, spawnPos.y, spawnPos.z)
+                .setLinearDamping(1.2)   // Heavy resistance so it slows down realistically
+                .setAngularDamping(0.8); // High rolling friction
+            
+            const rigidBody = world.createRigidBody(bodyDesc);
+            
+            // Give it a substantial mass (e.g., ~1.5 kg feel) so it resists light grazes
+            const colliderDesc = RAPIER.ColliderDesc.ball(0.125)
+                .setDensity(1.5)         // Increases mass relative to size
+                .setRestitution(0.4)     // Lower bounciness (less rubbery, more solid)
+                .setFriction(0.6);       // Grippy floor friction
+            
+            world.createCollider(colliderDesc, rigidBody);
+
+            physicsBalls.push({ mesh: ballMesh, body: rigidBody, radius: 0.125 });
+            console.log("Heavy Kickable MR Ball spawned.");
+        }
+
+        init();
+    </script>
+</body>
+</html>

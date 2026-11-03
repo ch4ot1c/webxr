@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Quest 3 MR: Extended Guardian & Virtual World</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body, html { 
+            margin: 0; 
+            padding: 0;
+            overflow: hidden; 
+            background-color: transparent !important; 
+            color: white; 
+            font-family: sans-serif; 
+        }
+        
+        #info { 
+            position: absolute; 
+            top: 20px; left: 20px; 
+            z-index: 100; 
+            pointer-events: none; 
+            text-shadow: 1px 1px 2px black; 
+        }
+        h1 { margin: 0 0 10px 0; font-size: 24px; color: #00ffcc; }
+        p { margin: 0; line-height: 1.5; }
+        #loading { 
+            position: absolute; 
+            top: 50%; left: 50%; 
+            transform: translate(-50%, -50%); 
+            font-size: 20px; color: #00ffcc; 
+            z-index: 200;
+        }
+
+        #xr-dom-overlay-root {
+            position: absolute;
+            width: 0px;
+            height: 0px;
+            overflow: hidden;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+    <div id="info">
+        <h1>Extended Guardian & VR World</h1>
+        <p>
+        1. Open in Meta Quest Browser & Enter AR.<br/>
+        2. Walk near physical tables/walls to reveal them.<br/>
+        3. <b>Right Thumbstick:</b> Adjust floor height (Up/Down) OR Rotate (Left/Right).<br/>
+        4. <b>Left Thumbstick:</b> Move & Strafe (Smooth Locomotion).<br/>
+        5. <b>Left Grip + Thumbstick (Up/Down):</b> Scale world.<br/>
+        6. <b>A Button (Right):</b> Toggle Custom/Default Room.<br/>
+        7. <b>X Button (Left):</b> Toggle Enclosure (Passthrough / Black / White).<br/>
+        </p>
+    </div>
+    <div id="loading">Initializing Physics & Engine...</div>
+    
+    <div id="xr-dom-overlay-root"></div>
+
+    <!-- Import Maps -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+            "@dimforge/rapier3d-compat": "https://unpkg.com/@dimforge/rapier3d-compat@0.13.1/rapier.es.js"
+        }
+    }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+        import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+        
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+        import * as BufferGeometryUtils from 'three/addons/utils/BufferGeometryUtils.js';
+        
+        import RAPIER from '@dimforge/rapier3d-compat';
+
+        let scene, camera, renderer, world;
+        let controller1, controller2;
+        let grip1, grip2;
+        
+        let virtualWorldGroup;
+        let floorPhysicsBody; 
+        
+        let defaultHullMesh, defaultHullMat;
+        let customHullMesh, customHullMat;
+        let voidState = 1; 
+        
+        let defaultRoomGroup;
+        let customRoomGroup;
+        let isCustomRoomActive = false;
+        
+        let rightFacePressed = false;
+        let leftFacePressed = false;
+        
+        let currentFloorOffset = 0;
+        let currentScale = 1.0;
+        
+        const trackPoints = [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()];
+        const physicalRoomMeshes = new Map();
+        let guardianMaterial;
+        let referenceSpace = null;
+
+        const ENABLE_GEOMETRY_SANITIZER = false;
+
+        init();
+
+        async function init() {
+            await RAPIER.init();
+            world = new RAPIER.World({ x: 0.0, y: -9.81, z: 0.0 });
+
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 300);
+            
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setClearColor(0x000000, 0); 
+            
+            renderer.xr.enabled = true;
+            renderer.xr.setReferenceSpaceType('local-floor');
+
+            document.body.appendChild(renderer.domElement);
+            
+            const domOverlayRoot = document.getElementById('xr-dom-overlay-root');
+            document.body.appendChild(ARButton.createButton(renderer, { 
+                requiredFeatures: ['mesh-detection', 'local-floor'],
+                domOverlay: { root: domOverlayRoot }
+            }));
+
+            const light = new THREE.HemisphereLight(0xffffff, 0x444444, 1.0);
+            light.position.set(0, 4, 0);
+            scene.add(light);
+            
+            virtualWorldGroup = new THREE.Group();
+            scene.add(virtualWorldGroup);
+
+            loadVirtualWorld();
+            setupGuardianShader();
+            setupControllers();
+
+            renderer.xr.addEventListener('sessionstart', () => {
+                referenceSpace = renderer.xr.getReferenceSpace();
+                document.getElementById('info').style.display = 'none';
+            });
+            
+            renderer.xr.addEventListener('sessionend', () => {
+                document.getElementById('info').style.display = 'block';
+            });
+
+            document.getElementById('loading').style.display = 'none';
+            renderer.setAnimationLoop(render);
+        }
+
+        function setupControllers() {
+            const controllerModelFactory = new XRControllerModelFactory();
+
+            function onConnected(event) {
+                this.userData.active = true;
+            }
+            function onDisconnected() {
+                this.userData.active = false;
+            }
+
+            controller1 = renderer.xr.getController(0);
+            controller1.addEventListener('connected', onConnected);
+            controller1.addEventListener('disconnected', onDisconnected);
+            scene.add(controller1);
+
+            grip1 = renderer.xr.getControllerGrip(0);
+            grip1.add(controllerModelFactory.createControllerModel(grip1));
+            scene.add(grip1);
+
+            controller2 = renderer.xr.getController(1);
+            controller2.addEventListener('connected', onConnected);
+            controller2.addEventListener('disconnected', onDisconnected);
+            scene.add(controller2);
+
+            grip2 = renderer.xr.getControllerGrip(1);
+            grip2.add(controllerModelFactory.createControllerModel(grip2));
+            scene.add(grip2);
+        }
+
+        // --- Bulletproof Z-Fighting Sanitizer ---
+        function sanitizeGeometry(mesh) {
+            if (!mesh.geometry) return;
+            let geom = mesh.geometry;
+            
+            try {
+                // 1. Weld overlapping vertices (0.1mm tolerance)
+                geom = BufferGeometryUtils.mergeVertices(geom, 0.0001);
+                
+                // 2. Prune perfectly overlapping duplicate faces
+                if (geom.index) {
+                    const indices = geom.index.array;
+                    const seenFaces = new Map();
+                    
+                    // Only treat as MultiMaterial if it's actually an array
+                    const isMultiMaterial = Array.isArray(mesh.material);
+                    const materials = isMultiMaterial ? mesh.material : [mesh.material];
+                    
+                    // If no groups exist, fallback to group 0
+                    const groups = geom.groups.length > 0 ? geom.groups : [{start: 0, count: indices.length, materialIndex: 0}];
+                    
+                    for (let i = 0; i < indices.length; i += 3) {
+                        const a = indices[i];
+                        const b = indices[i+1];
+                        const c = indices[i+2];
+                        
+                        // Numeric sort creates a deterministic face signature
+                        const faceSig = [a, b, c].sort((x, y) => x - y).join(',');
+                        
+                        let materialIndex = 0;
+                        for (let g = 0; g < groups.length; g++) {
+                            if (i >= groups[g].start && i < groups[g].start + groups[g].count) {
+                                materialIndex = groups[g].materialIndex;
+                                break;
+                            }
+                        }
+                        
+                        const mat = materials[materialIndex];
+                        const hasTexture = mat && (mat.map !== null || mat.normalMap !== null);
+                        
+                        if (!seenFaces.has(faceSig)) {
+                            seenFaces.set(faceSig, { matIndex: materialIndex, hasTex: hasTexture, a, b, c });
+                        } else {
+                            // OVERLAP DETECTED: Keep the textured one if available
+                            const existing = seenFaces.get(faceSig);
+                            if (hasTexture && !existing.hasTex) {
+                                seenFaces.set(faceSig, { matIndex: materialIndex, hasTex: true, a, b, c });
+                            }
+                        }
+                    }
+                    
+                    // 3. Rebuild valid indices and correct groups
+                    const newIndices = [];
+                    const newGroups = [];
+                    const facesByMat = {};
+                    
+                    seenFaces.forEach((face) => {
+                        if (!facesByMat[face.matIndex]) facesByMat[face.matIndex] = [];
+                        facesByMat[face.matIndex].push(face.a, face.b, face.c);
+                    });
+                    
+                    let currentIndex = 0;
+                    for (const [matIdxStr, inds] of Object.entries(facesByMat)) {
+                        const matIdx = parseInt(matIdxStr);
+                        newIndices.push(...inds);
+                        newGroups.push({
+                            start: currentIndex,
+                            count: inds.length,
+                            materialIndex: matIdx
+                        });
+                        currentIndex += inds.length;
+                    }
+                    
+                    geom.setIndex(newIndices);
+                    
+                    // Only assign groups if we actually have multiple materials.
+                    // Otherwise, WebGLRenderer throws undefined errors and the mesh disappears.
+                    if (isMultiMaterial || newGroups.length > 1) {
+                        geom.groups = newGroups;
+                        if (!isMultiMaterial) {
+                            mesh.material = [mesh.material];
+                        }
+                    } else {
+                        geom.groups = []; // Clear groups for standard single-material GLTF meshes
+                    }
+                }
+                
+                geom.computeVertexNormals();
+                mesh.geometry = geom;
+            } catch (err) {
+                console.warn("Sanitizer skipped a complex mesh: ", err);
+            }
+        }
+
+        function loadVirtualWorld() {
+            defaultRoomGroup = new THREE.Group();
+            
+            const defaultHullGeo = new THREE.BoxGeometry(120, 250, 120);
+            defaultHullMat = new THREE.MeshBasicMaterial({ 
+                color: 0x000000, 
+                side: THREE.BackSide,
+                visible: true 
+            });
+            defaultHullMesh = new THREE.Mesh(defaultHullGeo, defaultHullMat);
+            defaultHullMesh.position.y = 80; 
+            defaultRoomGroup.add(defaultHullMesh);
+            
+            // Expanded from 20m to 120m (with 120 divisions) to exactly match 
+            // the boundaries of the default hull walls so you never walk off the edge.
+            const grid = new THREE.GridHelper(120, 120, 0x00ffcc, 0x002244);
+            grid.position.y = 0.01;
+            defaultRoomGroup.add(grid);
+            
+            virtualWorldGroup.add(defaultRoomGroup);
+
+            customRoomGroup = new THREE.Group();
+            customRoomGroup.visible = false;
+            virtualWorldGroup.add(customRoomGroup);
+            
+            const placeholderGeo = new THREE.BoxGeometry(100, 250, 100);
+            customHullMat = new THREE.MeshBasicMaterial({ 
+                color: 0x000000, 
+                side: THREE.BackSide,
+                visible: true 
+            });
+            customHullMesh = new THREE.Mesh(placeholderGeo, customHullMat);
+            customHullMesh.position.y = 80;
+            customRoomGroup.add(customHullMesh);
+
+            const gltfLoader = new GLTFLoader();
+            const dracoLoader = new DRACOLoader();
+            dracoLoader.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.7/');
+            gltfLoader.setDRACOLoader(dracoLoader);
+
+            gltfLoader.load('play_area.glb', (gltf) => {
+                const customModel = gltf.scene;
+                customModel.position.y = 0; 
+                
+                customModel.traverse((child) => {
+                    if (child.isMesh && child.material) {
+                        child.material.side = THREE.FrontSide; 
+                        
+                        if (ENABLE_GEOMETRY_SANITIZER) {
+                            sanitizeGeometry(child);
+                        }
+                    }
+                });
+                customRoomGroup.add(customModel);
+
+                const bbox = new THREE.Box3().setFromObject(customModel);
+                const size = bbox.getSize(new THREE.Vector3());
+                const center = bbox.getCenter(new THREE.Vector3());
+
+                const hullWidth = Math.max(size.x * 2.5, 80);
+                const hullDepth = Math.max(size.z * 2.5, 80);
+                const hullHeight = Math.max(size.y * 4.0, 250); 
+
+                customHullMesh.geometry.dispose();
+                customHullMesh.geometry = new THREE.BoxGeometry(hullWidth, hullHeight, hullDepth);
+                customHullMesh.position.set(center.x, center.y, center.z);
+
+                console.log("Fitted bounding hull generated around custom .glb");
+            }, undefined, (error) => {
+                console.warn("Custom room GLB not found. (Using placeholder bounding walls).");
+            });
+
+            let groundBodyDesc = RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(0, 0, 0);
+            floorPhysicsBody = world.createRigidBody(groundBodyDesc);
+            
+            let groundColliderDesc = RAPIER.ColliderDesc.cuboid(500.0, 0.1, 500.0);
+            world.createCollider(groundColliderDesc, floorPhysicsBody);
+        }
+
+        function updateEnclosureVisibility() {
+            const isVisible = (voidState !== 0);
+            const colorHex = (voidState === 2 ? 0xffffff : 0x000000);
+
+            if (defaultHullMat) {
+                defaultHullMat.visible = isVisible;
+                defaultHullMat.color.setHex(colorHex);
+            }
+            if (customHullMat) {
+                customHullMat.visible = isVisible;
+                customHullMat.color.setHex(colorHex);
+            }
+        }
+
+        function setupGuardianShader() {
+            guardianMaterial = new THREE.ShaderMaterial({
+                transparent: true,
+                depthWrite: false,
+                side: THREE.DoubleSide,
+                uniforms: {
+                    trackPoints: { value: trackPoints },
+                    threshold: { value: 0.6 },
+                    gridColor: { value: new THREE.Color(0x00ffff) }
+                },
+                vertexShader: `
+                    varying vec3 vWorldPosition;
+                    void main() {
+                        vec4 worldPos = modelMatrix * vec4(position, 1.0);
+                        vWorldPosition = worldPos.xyz;
+                        gl_Position = projectionMatrix * viewMatrix * worldPos;
+                    }
+                `,
+                fragmentShader: `
+                    uniform vec3 trackPoints[3];
+                    uniform float threshold;
+                    uniform vec3 gridColor;
+                    varying vec3 vWorldPosition;
+
+                    void main() {
+                        float minDist = 999.0;
+                        for(int i = 0; i < 3; i++) {
+                            float dist = distance(vWorldPosition, trackPoints[i]);
+                            minDist = min(minDist, dist);
+                        }
+
+                        float grid = (abs(fract(vWorldPosition.x * 10.0) - 0.5) < 0.05 || 
+                                      abs(fract(vWorldPosition.y * 10.0) - 0.5) < 0.05 || 
+                                      abs(fract(vWorldPosition.z * 10.0) - 0.5) < 0.05) ? 1.0 : 0.0;
+
+                        float intensity = 1.0 - smoothstep(0.0, threshold, minDist);
+                        if(intensity <= 0.01) discard;
+
+                        float alpha = intensity * (0.1 + (grid * 0.7));
+                        vec3 finalColor = gridColor + (grid * vec3(0.5));
+                        gl_FragColor = vec4(finalColor, alpha);
+                    }
+                `
+            });
+        }
+
+        function updateRoomMeshes(frame) {
+            if (!frame || !frame.detectedMeshes) return;
+
+            for (const xrMesh of frame.detectedMeshes) {
+                let meshData = physicalRoomMeshes.get(xrMesh);
+                
+                if (!meshData || meshData.lastChangedTime !== xrMesh.lastChangedTime) {
+                    const geometry = new THREE.BufferGeometry();
+                    geometry.setAttribute('position', new THREE.BufferAttribute(xrMesh.vertices, 3));
+                    geometry.setIndex(new THREE.BufferAttribute(xrMesh.indices, 1));
+                    geometry.computeVertexNormals();
+
+                    if (!meshData) {
+                        const threeMesh = new THREE.Mesh(geometry, guardianMaterial);
+                        scene.add(threeMesh); 
+                        
+                        const rigidBodyDesc = RAPIER.RigidBodyDesc.fixed();
+                        const rigidBody = world.createRigidBody(rigidBodyDesc);
+                        
+                        const vertices = new Float32Array(xrMesh.vertices);
+                        const indices = new Uint32Array(xrMesh.indices);
+                        const colliderDesc = RAPIER.ColliderDesc.trimesh(vertices, indices);
+                        const collider = world.createCollider(colliderDesc, rigidBody);
+
+                        meshData = { threeMesh, rigidBody, collider, lastChangedTime: xrMesh.lastChangedTime };
+                        physicalRoomMeshes.set(xrMesh, meshData);
+                    } else {
+                        meshData.threeMesh.geometry.dispose();
+                        meshData.threeMesh.geometry = geometry;
+                        meshData.lastChangedTime = xrMesh.lastChangedTime;
+                        
+                        world.removeCollider(meshData.collider, false);
+                        const vertices = new Float32Array(xrMesh.vertices);
+                        const indices = new Uint32Array(xrMesh.indices);
+                        const colliderDesc = RAPIER.ColliderDesc.trimesh(vertices, indices);
+                        meshData.collider = world.createCollider(colliderDesc, meshData.rigidBody);
+                    }
+                }
+
+                const pose = frame.getPose(xrMesh.meshSpace, referenceSpace);
+                if (pose) {
+                    const m = pose.transform.matrix;
+                    meshData.threeMesh.matrix.fromArray(m);
+                    meshData.threeMesh.matrixAutoUpdate = false;
+                    
+                    const pos = new THREE.Vector3().setFromMatrixPosition(meshData.threeMesh.matrix);
+                    const quat = new THREE.Quaternion().setFromRotationMatrix(meshData.threeMesh.matrix);
+                    meshData.rigidBody.setTranslation(pos, true);
+                    meshData.rigidBody.setRotation(quat, true);
+                }
+            }
+
+            for (const [xrMesh, meshData] of physicalRoomMeshes) {
+                if (!frame.detectedMeshes.has(xrMesh)) {
+                    scene.remove(meshData.threeMesh);
+                    meshData.threeMesh.geometry.dispose();
+                    world.removeRigidBody(meshData.rigidBody);
+                    physicalRoomMeshes.delete(xrMesh);
+                }
+            }
+        }
+
+        function handleInput() {
+            const session = renderer.xr.getSession();
+            if (!session) return;
+            
+            for (const source of session.inputSources) {
+                if (!source.gamepad) continue;
+                
+                const faceButtonPressed = source.gamepad.buttons[4]?.pressed || source.gamepad.buttons[5]?.pressed || false;
+                
+                // --- RIGHT CONTROLLER (Strictly Height & Rotation) ---
+                if (source.handedness === 'right') {
+                    const xAxis = source.gamepad.axes[2];
+                    const yAxis = source.gamepad.axes[3];
+                    
+                    const absX = Math.abs(xAxis);
+                    const absY = Math.abs(yAxis);
+
+                    if (absY > 0.1 && absY >= absX) {
+                        currentFloorOffset += (yAxis * -0.05); 
+                        virtualWorldGroup.position.y = currentFloorOffset;
+                        
+                        floorPhysicsBody.setNextKinematicTranslation({
+                            x: virtualWorldGroup.position.x,
+                            y: currentFloorOffset,
+                            z: virtualWorldGroup.position.z
+                        });
+                    } 
+                    else if (absX > 0.8 && absX > absY) {
+                        const rotationSpeed = 0.03; 
+                        const deltaTheta = xAxis * rotationSpeed;
+                        
+                        const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), deltaTheta);
+                        const offset = virtualWorldGroup.position.clone().sub(camera.position);
+                        
+                        offset.applyQuaternion(q);
+                        virtualWorldGroup.position.copy(camera.position).add(offset);
+                        virtualWorldGroup.quaternion.premultiply(q);
+                        
+                        floorPhysicsBody.setNextKinematicTranslation({
+                            x: virtualWorldGroup.position.x,
+                            y: currentFloorOffset, 
+                            z: virtualWorldGroup.position.z
+                        });
+                        
+                        const newQuat = new THREE.Quaternion().setFromEuler(virtualWorldGroup.rotation);
+                        floorPhysicsBody.setNextKinematicRotation(newQuat);
+                    }
+                    
+                    if (faceButtonPressed && !rightFacePressed) {
+                        isCustomRoomActive = !isCustomRoomActive;
+                        defaultRoomGroup.visible = !isCustomRoomActive;
+                        customRoomGroup.visible = isCustomRoomActive;
+                    }
+                    rightFacePressed = faceButtonPressed;
+                }
+                
+                // --- LEFT CONTROLLER (Strictly Movement, Strafe & Scale - NO ROTATION) ---
+                if (source.handedness === 'left') {
+                    const xAxis = source.gamepad.axes[2];
+                    const yAxis = source.gamepad.axes[3];
+                    
+                    const gripPressed = source.gamepad.buttons[1]?.pressed || false;
+
+                    if (gripPressed) {
+                        if (Math.abs(yAxis) > 0.1) {
+                            const scaleDelta = yAxis * -0.02; 
+                            const newScale = Math.max(0.01, Math.min(100.0, currentScale + scaleDelta));
+                            
+                            if (newScale !== currentScale) {
+                                const scaleRatio = newScale / currentScale;
+                                const playerX = camera.position.x;
+                                const playerZ = camera.position.z;
+                                
+                                virtualWorldGroup.position.x = playerX - (playerX - virtualWorldGroup.position.x) * scaleRatio;
+                                virtualWorldGroup.position.z = playerZ - (playerZ - virtualWorldGroup.position.z) * scaleRatio;
+                                
+                                virtualWorldGroup.scale.set(newScale, newScale, newScale);
+                                currentScale = newScale;
+                                
+                                floorPhysicsBody.setNextKinematicTranslation({
+                                    x: virtualWorldGroup.position.x,
+                                    y: currentFloorOffset, 
+                                    z: virtualWorldGroup.position.z
+                                });
+                            }
+                        }
+                    } else {
+                        let needsPhysicsUpdate = false;
+                        const moveSpeed = 0.05;
+                        const deadzone = 0.1;
+                        
+                        // 1. Move Forward / Backward (Y-Axis)
+                        if (Math.abs(yAxis) > deadzone) {
+                            const forward = new THREE.Vector3(0, 0, -1);
+                            forward.applyQuaternion(camera.quaternion);
+                            forward.y = 0; // Lock movement strictly to the horizontal floor plane
+                            forward.normalize();
+                            
+                            virtualWorldGroup.position.addScaledVector(forward, yAxis * moveSpeed);
+                            needsPhysicsUpdate = true;
+                        }
+                        
+                        // 2. Slide / Strafe Left / Right (X-Axis) - Pure side-to-side translation
+                        if (Math.abs(xAxis) > deadzone) {
+                            const right = new THREE.Vector3(1, 0, 0);
+                            right.applyQuaternion(camera.quaternion);
+                            right.y = 0; // Lock movement strictly to the horizontal floor plane
+                            right.normalize();
+                            
+                            // Multiply by negative xAxis so pushing stick right slides the world left (you move right)
+                            virtualWorldGroup.position.addScaledVector(right, -xAxis * moveSpeed);
+                            needsPhysicsUpdate = true;
+                        }
+                        
+                        // Apply position changes to the physics floor collider
+                        if (needsPhysicsUpdate) {
+                            floorPhysicsBody.setNextKinematicTranslation({
+                                x: virtualWorldGroup.position.x,
+                                y: currentFloorOffset, 
+                                z: virtualWorldGroup.position.z
+                            });
+                        }
+                    }
+
+                    if (faceButtonPressed && !leftFacePressed) {
+                        voidState = (voidState + 1) % 3; 
+                        updateEnclosureVisibility();
+                    }
+                    leftFacePressed = faceButtonPressed;
+                }
+            }
+        }
+
+        function render(timestamp, frame) {
+            handleInput();
+            world.step();
+
+            if (renderer.xr.isPresenting) {
+                // --- Keep the Enclosing Walls Centered on the Player ---
+                const camPos = new THREE.Vector3().setFromMatrixPosition(camera.matrixWorld);
+                if (defaultHullMesh) defaultHullMesh.position.set(camPos.x - virtualWorldGroup.position.x, 80, camPos.z - virtualWorldGroup.position.z);
+                if (customHullMesh) customHullMesh.position.set(camPos.x - virtualWorldGroup.position.x, 80, camPos.z - virtualWorldGroup.position.z);
+
+                trackPoints[0].copy(camPos);
+                
+                if (controller1 && controller1.userData.active) {
+                    trackPoints[1].setFromMatrixPosition(controller1.matrixWorld);
+                } else {
+                    trackPoints[1].set(9999, 9999, 9999);
+                }
+
+                if (controller2 && controller2.userData.active) {
+                    trackPoints[2].setFromMatrixPosition(controller2.matrixWorld);
+                } else {
+                    trackPoints[2].set(9999, 9999, 9999);
+                }
+
+                guardianMaterial.uniforms.trackPoints.value = trackPoints;
+
+                if (frame && referenceSpace) {
+                    updateRoomMeshes(frame);
+                }
+            }
+            renderer.render(scene, camera);
+        }
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>

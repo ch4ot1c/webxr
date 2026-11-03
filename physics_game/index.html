@@ -1,0 +1,2030 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Quest 3 AR/MR Target Practice</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body { margin: 0; overflow: hidden; background: #111; color: white; font-family: sans-serif; }
+        #info { position: absolute; top: 20px; left: 20px; z-index: 100; pointer-events: none; text-shadow: 1px 1px 2px black; }
+        h1 { margin: 0 0 10px 0; font-size: 24px; color: #00ffcc; }
+        p { margin: 0; line-height: 1.5; }
+    </style>
+</head>
+
+<!--
+Instructions to set up and run on Quest 3:
+
+0. In Quest OS -> Settings -> Environment Setup: Configure - Floor Height, Guardian Boundary, Space Setup
+
+1. Start a local HTTP server:
+
+On your PC, Run a standard local server in the folder containing your index.html file, in the terminal.
+
+Bash
+# Node.js
+npx serve -p 8080
+# Or Python
+python -m http.server 8080
+# Or,
+npx live-server --port=8080
+
+2. Connect the Quest 3 via USB: Plug the headset into your PC. Ensure developer mode is enabled on the Quest.
+
+3. Forward the port using ADB: Open your terminal and run the reverse port-forwarding command. This maps the Quest's internal localhost:8080 directly to your PC's localhost:8080.
+
+In a separate terminal:
+Bash
+.\adb reverse tcp:8080 tcp:8080
+
+4. Open localhost in the headset:Quest Browser. Put on the headset, open the Meta Quest Browser, and navigate to: http://localhost:8080
+
+Windows (Android Studio): cd %LOCALAPPDATA%\Android\Sdk\platform-tools\
+macOS (Android Studio): cd ~/Library/Android/sdk/platform-tools/
+
+Verification
+Once installed or located, plug in your Quest 3, and to ensure your computer sees it, run:
+
+Bash
+adb devices
+
+5. Open the 'Browser' app on the Quest 3, go to localhost:8080. The app should be running. Accept permissions and it starts.
+
+Double tap the small buttons on the controllers to exit the app.
+-->
+
+<body>
+    <div id="info">
+        <h1>AR/MR Physics Sandbox</h1>
+
+        <div style="display: flex; gap: 40px; margin-top: 15px;">
+            <div>
+                <h2 style="font-size: 18px; color: #ffaa00; margin-bottom: 5px;">Right Controller (Main)</h2>
+                <p>
+                • <b>Trigger:</b> Fire weapon (Balls/Lasers)<br/>
+                • <b>B Button:</b> Cycle Modes (Balls → Lasers → Paddle → Shield → Sword)<br/>
+                • <b>A Button:</b> Toggle Laser Pointer / Cycle Sword Stances<br/>
+                • <b>Grip (Hold):</b> Activate Gesture Spellcasting
+                </p>
+            </div>
+
+            <div>
+                <h2 style="font-size: 18px; color: #00aaff; margin-bottom: 5px;">Left Controller (Offhand)</h2>
+                <p>
+                • <b>Trigger (Hold & Release):</b> Grab and throw physics balls<br/>
+                • <b>X Button:</b> Toggle Avatar (Head/Hands) Visibility<br/>
+                • <b>Y Button:</b> Toggle Shield Mode (Absorb vs Deflect)<br/>
+                • <b>Thumbstick Click:</b> Toggle Dummy Training Launcher<br/>
+                • <b>Grip:</b> Toggle Room Scan Mesh Visibility
+                </p>
+            </div>
+        </div>
+
+        <div style="margin-top: 20px;">
+            <h2 style="font-size: 18px; color: #00ffcc; margin-bottom: 5px;">Motion Actions</h2>
+            <p>
+            • <b>Eat/Drink:</b> Bring controller to mouth (tilt sideways to drink)<br/>
+            • <b>Spellcasting:</b> Hold Right Grip and trace glowing orbs to cast spells<br/>
+            • <b>Tennis Paddle:</b> Swing fast to spike the ball (Underhand toss with left hand for moon-gravity)
+            </p>
+        </div>
+    </div>
+
+    <!-- Import Maps -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+            "@dimforge/rapier3d-compat": "https://unpkg.com/@dimforge/rapier3d-compat@0.13.1/rapier.es.js"
+        }
+    }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
+        import { Reflector } from 'three/addons/objects/Reflector.js';
+        import RAPIER from '@dimforge/rapier3d-compat';
+
+        let scene, camera, renderer, world, eventQueue;
+
+        // Game State
+        const projectiles = [];
+        const targets = [];
+        const xrMeshes = new Map();
+        const clock = new THREE.Clock();
+
+        // --- ARCHITECTURE TOGGLE ---
+        const USE_ACCUMULATOR = false; // Set to TRUE for 180Hz sub-stepping, FALSE for 1:1 90Hz
+        let physicsAccumulator = 0;
+
+        let fireMode = 'ball'; // 'ball' or 'laser'
+        let meshesVisible = true;
+        let pointerVisible = true;
+
+        // Button State Tracking
+        let aWasPressed = false, bWasPressed = false, leftGripWasPressed = false;
+
+        // Visuals & HUD
+        let weaponGroup, pointerLine;
+        let hudCtx, hudTex, hudSprite;
+
+        let physicsFloorCreated = false;
+
+        // --- GLTF & FBX TARGET STATE ---
+        const gltfTargets = []; // and FBX
+        let physicsFloorY = null; // Remembers the true floor height for late-loading GLTFs
+
+        let mixer = null;
+
+        // --- CACHED ASSETS (Prevents VR Frame Drops) ---
+        const ballGeo = new THREE.SphereGeometry(0.02, 16, 16);
+        const ballMat = new THREE.MeshStandardMaterial({ color: 0x33ff66, roughness: 0.2 });
+        // .rotateX(Math.PI / 2) to lay the cylinder flat along the forward Z-axis
+        const laserGeo = new THREE.CylinderGeometry(0.01, 0.01, 0.1).rotateX(Math.PI / 2);
+        const laserMat = new THREE.MeshBasicMaterial({ color: 0xff0000 });
+
+        // --- LEFT HAND THROWING STATE ---
+        let leftController = null;
+        let leftIsGrabbing = false;
+        let heldBallMesh = null;
+        const leftPrevPos = new THREE.Vector3();
+        const leftVelocity = new THREE.Vector3();
+
+        // --- PADDLE & TENNIS STATE ---
+        let rightGrip = null; // Used to track the right hand's physical location
+        let paddleGroup, paddleBody, paddleCollider;
+        let tennisTarget = null;
+        const headPrevPos = new THREE.Vector3();
+        const paddleVelocity = new THREE.Vector3();
+
+        // --- SWORD STATE ---
+        let swordGroup, swordBody, swordCollider;
+        let swordDummy = null;
+        const swordPrevPos = new THREE.Vector3();
+        const swordVelocity = new THREE.Vector3();
+        let lastSwordHitTime = 0; // Cooldown to prevent multi-hit spam
+        let isInsideDummy = false; // Tracks whether the blade is currently inside the dummy
+        let swordState = 0; // 0: Katana, 1: Dagger Underhand, 2: Dagger Overhand. 3: Whip
+
+        let whipLinks = []; // Stores the dynamic physics bodies, colliders, and meshes for the whip
+
+        // --- SHIELD & LAUNCHER STATE ---
+        let shieldGroup = new THREE.Group();
+        let shieldBody = null;
+        let shieldCollider = null;
+        let shieldMesh = null;
+        let shieldAbsorbMode = false; // false = deadened bounce, true = absorb/destroy
+        let trainingLauncherActive = false;
+        let lastLauncherSpawn = 0;
+        let leftThumbstickWasPressed = false;
+
+        // --- GESTURE CASTING STATE ---
+        const TARGET_RADIUS = 0.1; // 15cm forgiveness bubble
+        const GESTURE_TIMEOUT = 3000; // 3 seconds to complete a sequence before it resets
+        let activeSpellIndex = null;
+        let currentSpellStep = 0;
+        let spellStartTime = 0;
+        let lastSpellCastTime = 0; // Cooldown to prevent spamming
+        let gestureIndicators = [];
+        // --- EAT / DRINK SYSTEM STATE ---
+        let leftConsumeState = 0; // 0: Away, 1: Eat, 2: Drink
+        let rightConsumeState = 0;
+        let lastConsumeTime = 0;
+
+        // --- AVATAR STATE ---
+        const avatarMeshes = [];
+        let avatarVisible = true;
+        let leftXWasPressed = false;
+        let leftYWasPressed = false;
+
+        // Define the spells based on X (Left/Right), Y (Up/Down), Z (Forward/Back) offsets from the headset
+        const spellSequences = [
+            {
+                name: "Barrage",
+                color: 0x00ffff, // Cyan
+                steps: [
+                    // 1. Both arms in front of the chest
+                    { left: [-0.1, -0.22, -0.25], right: [0.1, -0.22, -0.25] },
+                    // 2. Both arms all the way up and further forward
+                    { left: [-0.35, 0.45, -0.3], right: [0.35, 0.45, -0.3] }
+                ]
+            },
+            {
+                name: "Blitz",
+                color: 0xff00ff, // Magenta
+                steps: [
+                    // 1. Right arm up above the shoulder
+                    { right: [0.15, 0.4, -0.22] },
+                    // 2. Down to just in front of the shoulder
+                    { right: [0.15, -0.2, -0.22] },
+                    // 3. All the way out forward from the shoulder
+                    { right: [0.1, -0.2, -0.75] }
+                ]
+            }
+        ];
+
+        // --- PRE-ALLOCATED MATH VECTORS (PREVENTS GC STUTTER) ---
+        const _meshWorldPos = new THREE.Vector3();
+        const _meshWorldQuat = new THREE.Quaternion();
+        const _meshWorldQuatInv = new THREE.Quaternion();
+        const _projWorldPos = new THREE.Vector3();
+        const _localPos = new THREE.Vector3();
+
+        init();
+
+        async function init() {
+            await RAPIER.init();
+            world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
+            // Locks simulation step to match Quest 3 90Hz or 180Hz refresh rate, to test double-stepped
+            world.timestep = USE_ACCUMULATOR ? (1 / 180) : (1 / 90);
+            eventQueue = new RAPIER.EventQueue(true); // Enable collision events
+
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+            scene.add(new THREE.DirectionalLight(0xffffff, 1.5));
+            scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            renderer.xr.setReferenceSpaceType('local-floor'); // Fixes floor height
+            document.body.appendChild(renderer.domElement);
+
+            document.body.appendChild(ARButton.createButton(renderer, {
+                requiredFeatures: ['local-floor'],
+                optionalFeatures: ['hand-tracking', 'mesh-detection', 'plane-detection']
+            }));
+
+            setupHUD();
+
+            // --- ADD PLAYER AVATAR (HEAD) ---
+            const headGeo = new THREE.BoxGeometry(0.2, 0.12, 0.15);
+            const headMat = new THREE.MeshStandardMaterial({ color: 0xdddddd, roughness: 0.4 });
+            const headsetMesh = new THREE.Mesh(headGeo, headMat);
+            headsetMesh.position.set(0, 0, 0.05); // Shift slightly forward onto the "face"
+            camera.add(headsetMesh);
+            avatarMeshes.push(headsetMesh);
+
+            setupWeapon();
+            setupTargets(); // 3 air targets
+            // Spawn multiple Animated GLTFs with unique Names, IDs, and X-offsets
+            setupGLTFTarget('https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/Fox/glTF-Binary/Fox.glb', 'Alpha Fox', 'GLTF-01', 0, 2.0, -1.5);
+            setupGLTFTarget('https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/Fox/glTF-Binary/Fox.glb', 'Beta Fox', 'GLTF-02', 1.2, 2.0, -1.5);
+            // Animated FBX
+            setupFBXTarget('https://raw.githubusercontent.com/mrdoob/three.js/master/examples/models/fbx/Samba%20Dancing.fbx', 'Samba Dancer', 'FBX-01', 1.5, 2.0, -1.5);
+            setupTennisTarget();
+            setupSword();
+            setupSwordDummy();
+            setupGestures();
+
+            setupMirror();
+
+            setupShield();
+
+            window.addEventListener('resize', onWindowResize);
+            renderer.setAnimationLoop(render);
+        }
+
+        // --- HUD SETUP ---
+        function setupHUD() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 1024; canvas.height = 256;
+            hudCtx = canvas.getContext('2d');
+            hudTex = new THREE.CanvasTexture(canvas);
+
+            const mat = new THREE.SpriteMaterial({ map: hudTex, depthTest: false }); // depthTest: false keeps it drawn over the world
+            hudSprite = new THREE.Sprite(mat);
+
+            // Make the HUD smaller
+            hudSprite.scale.set(0.6, 0.15, 1);
+
+            // Move to top-right corner of the view
+            camera.add(hudSprite);
+            hudSprite.position.set(0.5, 0.35, -1);
+            scene.add(camera);
+
+            updateHUD("System Ready", "Mode: Bouncy Balls");
+        }
+
+        function updateHUD(text1, text2) {
+            hudCtx.clearRect(0, 0, 1024, 256);
+            hudCtx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+            hudCtx.fillRoundRect ? hudCtx.fillRoundRect(0, 0, 1024, 256, 30) : hudCtx.fillRect(0,0,1024,256);
+
+            hudCtx.font = 'bold 60px sans-serif';
+            hudCtx.fillStyle = 'white';
+            hudCtx.fillText(text1, 40, 100);
+
+            hudCtx.fillStyle = '#00ffcc';
+            hudCtx.fillText(text2, 40, 200);
+            hudTex.needsUpdate = true;
+        }
+
+        // ---
+
+        function playHaptic(handedness, intensity, duration) {
+            try {
+                const session = renderer.xr.getSession();
+                if (!session || !session.inputSources) return;
+
+                for (const source of session.inputSources) {
+                    if (source.handedness === handedness && source.gamepad) {
+                        const gp = source.gamepad;
+
+                        // 1. Meta / Chromium standard vibration actuator
+                        if (gp.vibrationActuator) {
+                            gp.vibrationActuator.playEffect("dual-rumble", {
+                                startDelay: 0,
+                                duration: duration,
+                                weakMagnitude: intensity,
+                                strongMagnitude: intensity
+                            }).catch(() => {});
+                        }
+                        // 2. Fallback haptic actuators array
+                        else if (gp.hapticActuators && gp.hapticActuators.length > 0) {
+                            gp.hapticActuators[0].pulse(intensity, duration).catch(() => {});
+                        }
+                    }
+                }
+            } catch (e) {
+                // Fail silently
+            }
+        }
+
+        function setupGestures() {
+            const geo = new THREE.SphereGeometry(0.08, 16, 16);
+            // Create a pool of 10 indicators, each with their own material instance
+            for (let i = 0; i < 10; i++) {
+                const mat = new THREE.MeshBasicMaterial({
+                    color: 0x00ffff,
+                    transparent: true,
+                    opacity: 0.3,
+                    depthWrite: false,
+                    wireframe: false
+                });
+
+                const mesh = new THREE.Mesh(geo, mat);
+                mesh.visible = false;
+                scene.add(mesh);
+                gestureIndicators.push(mesh);
+            }
+        }
+
+        // --- WEAPON SETUP ---
+        const USE_PISTOL_GRIP = true; // Toggle this to change how the gun is held
+
+        function setupWeapon() {
+            weaponGroup = new THREE.Group();
+
+            // Blaster Body
+            const body = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.05, 0.15), new THREE.MeshStandardMaterial({ color: 0x333333 }));
+            const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.015, 0.015, 0.1), new THREE.MeshStandardMaterial({ color: 0x666666 }));
+            barrel.rotation.x = Math.PI / 2;
+            barrel.position.z = -0.1;
+
+            weaponGroup.add(body);
+            weaponGroup.add(barrel);
+
+            // Laser Pointer
+            const lineGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -10)]);
+            pointerLine = new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ color: 0xff0000, transparent: true, opacity: 0.5 }));
+            pointerLine.position.z = -0.15;
+            weaponGroup.add(pointerLine);
+
+            // Angle the weapon up so it acts like a pistol grip instead of a wand
+            if (USE_PISTOL_GRIP) {
+                weaponGroup.rotation.x = THREE.MathUtils.degToRad(-60);
+            }
+
+            // --- PADDLE SETUP ---
+            paddleGroup = new THREE.Group();
+
+            const handleGeo = new THREE.CylinderGeometry(0.015, 0.015, 0.2);
+            const handle = new THREE.Mesh(handleGeo, new THREE.MeshStandardMaterial({ color: 0x222222 }));
+            handle.position.y = 0.0;
+
+            const headGeo = new THREE.CylinderGeometry(0.12, 0.12, 0.02, 32);
+            const head = new THREE.Mesh(headGeo, new THREE.MeshStandardMaterial({ color: 0xee2222 }));
+            head.position.y = 0.22;
+            head.rotation.x = Math.PI / 2;
+
+            paddleGroup.add(handle);
+            paddleGroup.add(head);
+            paddleGroup.visible = false;
+            scene.add(paddleGroup);
+
+            const pBodyDesc = RAPIER.RigidBodyDesc.kinematicPositionBased()
+                .setTranslation(0, -10, 0)
+                .setCcdEnabled(true);
+            paddleBody = world.createRigidBody(pBodyDesc);
+
+
+            const pColDesc = RAPIER.ColliderDesc.cuboid(0.12, 0.12, 0.01)
+                .setTranslation(0, 0.22, 0)
+                .setRestitution(0.8)
+                .setRestitutionCombineRule(RAPIER.CoefficientCombineRule.Min)
+                .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
+            paddleCollider = world.createCollider(pColDesc, paddleBody);
+
+            // Dynamically bind to controllers
+            for (let i = 0; i < 2; i++) {
+                const controller = renderer.xr.getController(i);
+                const grip = renderer.xr.getControllerGrip(i);
+
+                controller.addEventListener('connected', function (event) {
+                    // --- ADD PLAYER AVATAR (HANDS) ---
+                    const handGeo = new THREE.BoxGeometry(0.06, 0.06, 0.1);
+                    const handMat = new THREE.MeshStandardMaterial({ color: 0x888888 });
+                    const handMesh = new THREE.Mesh(handGeo, handMat);
+
+                    avatarMeshes.push(handMesh);
+
+                    if (event.data.handedness === 'right') {
+                        rightGrip = grip;
+                        grip.add(handMesh); // Show right hand in mirror
+                        grip.add(weaponGroup);
+                        this.addEventListener('selectstart', fireWeapon);
+                    } else if (event.data.handedness === 'left') {
+                        leftController = this;
+                        grip.add(handMesh); // Show left hand in mirror
+                        if (!heldBallMesh) {
+                            heldBallMesh = new THREE.Mesh(ballGeo, ballMat);
+                            grip.add(heldBallMesh);
+                        }
+                        heldBallMesh.visible = false;
+                        this.addEventListener('selectstart', () => { leftIsGrabbing = true; heldBallMesh.visible = true; });
+                        this.addEventListener('selectend', throwLeftBall);
+                    }
+                });
+
+                controller.addEventListener('disconnected', function (event) {
+                    if (event.data.handedness === 'right') {
+                        rightGrip = null;
+                        grip.remove(weaponGroup);
+                        this.removeEventListener('selectstart', fireWeapon);
+                    } else if (event.data.handedness === 'left') {
+                        leftController = null;
+                        leftIsGrabbing = false;
+                        if (heldBallMesh) heldBallMesh.visible = false;
+                    }
+                });
+
+                scene.add(controller);
+                scene.add(grip);
+            }
+        }
+
+        // --- LEFT HAND THROW LOGIC ---
+        function throwLeftBall() {
+            if (!leftIsGrabbing) return;
+            leftIsGrabbing = false;
+            if (heldBallMesh) heldBallMesh.visible = false;
+
+            const spawnPos = new THREE.Vector3();
+            leftController.getWorldPosition(spawnPos);
+
+            const throwVel = leftVelocity.clone();
+            const quat = new THREE.Quaternion();
+            leftController.getWorldQuaternion(quat);
+            const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(quat).normalize();
+
+            let ballGravityScale = 1.0; // Default gravity
+
+            if (fireMode === 'paddle') {
+                // 1. UNDERHAND TOSS LOGIC
+                // Check if the physical hand is moving UPWARD
+                if (throwVel.y > 0.4) {
+                    // Valid underhand toss. Dampen speed so it arcs nicely.
+                    throwVel.multiplyScalar(0.6);
+                    if (throwVel.length() > 4.0) throwVel.setLength(4.0);
+                } else {
+                    // Not an upward throw! Just drop it dead from the hand.
+                    throwVel.set(0, 0, 0);
+                }
+
+                // 2. MOON GRAVITY
+                // 40% gravity gives the ball floaty "hang time" so you can track and hit it
+                ballGravityScale = 0.6;
+            } else {
+                // WEAPON MODE: Fast-ball assist.
+                throwVel.multiplyScalar(1.5);
+                throwVel.addScaledVector(forward, 2.0);
+                if (throwVel.length() > 20) throwVel.setLength(20);
+            }
+
+            // Create Physics Projectile with dynamic Gravity AND Air Resistance (Damping)
+            const airResistance = (fireMode === 'paddle') ? 0.2 : 0.0;
+            const desc = RAPIER.RigidBodyDesc.dynamic()
+                .setTranslation(spawnPos.x, spawnPos.y, spawnPos.z)
+                .setLinvel(throwVel.x, throwVel.y, throwVel.z)
+                .setGravityScale(ballGravityScale)
+                .setLinearDamping(airResistance)
+                .setCcdEnabled(true);
+
+            const body = world.createRigidBody(desc);
+            const colDesc = RAPIER.ColliderDesc.ball(0.02)
+                .setDensity(3.0) // Heavy
+                .setRestitution(0.95)
+                .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
+
+            const collider = world.createCollider(colDesc, body);
+
+            const mesh = new THREE.Mesh(ballGeo, ballMat);
+            scene.add(mesh);
+            projectiles.push({ body, collider, mesh, spawnTime: performance.now(), type: 'ball', hasBounced: false });
+        }
+
+        // --- TARGET SETUP ---
+        function setupTargets() {
+            createTarget(0, 1.5, -2.5, 'still', 'Center Target');
+            createTarget(-1.5, 1.3, -2.0, 'slow', 'Left Target');
+            createTarget(1.5, 1.7, -2.0, 'fast', 'Right Target');
+        }
+
+        function createTarget(x, y, z, moveType, name) {
+            const group = new THREE.Group();
+            const colors = [0xdcdcdc, 0x8c8c96, 0xdcdcdc, 0x8c8c96, 0x4b4b5a];
+
+            for (let i = 0; i < 5; i++) {
+                const radius = 0.3 - (i * 0.06);
+                const ring = new THREE.Mesh(
+                    new THREE.CylinderGeometry(radius, radius, 0.02, 32),
+                    new THREE.MeshStandardMaterial({ color: colors[i], roughness: 0.6 })
+                );
+                ring.rotation.x = Math.PI / 2;
+                ring.position.z = i * 0.005;
+                group.add(ring);
+            }
+            scene.add(group);
+
+            const bodyDesc = RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(x, y, z);
+            const body = world.createRigidBody(bodyDesc);
+
+            // Rotate the physics cylinder 90 degrees on the X-axis so it faces the player
+            // (matching the visual rings). Thickness to 0.1 to prevent laser tunneling.
+            const physicsRotation = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI / 2);
+
+            const colliderDesc = RAPIER.ColliderDesc.cylinder(0.1, 0.3)
+                .setRotation(physicsRotation)
+                .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
+
+            const collider = world.createCollider(colliderDesc, body);
+
+            targets.push({ mesh: group, body, collider, origin: new THREE.Vector3(x, y, z), desiredOrigin: new THREE.Vector3(x, y, z), moveType, timeOffset: Math.random() * 10, name });
+        }
+
+        // --- ANIMATED GLTF TARGET ---
+        function setupGLTFTarget(url, name, id, x, y, z) {
+            const loader = new GLTFLoader();
+            loader.load(url, (gltf) => {
+                const model = gltf.scene;
+
+                model.scale.set(0.01, 0.01, 0.01);
+                model.position.set(0, 0, 0);
+                model.updateMatrixWorld(true);
+
+                const vertices = [];
+                model.traverse((child) => {
+                    if (child.isMesh) {
+                        const pos = child.geometry.attributes.position;
+                        const v = new THREE.Vector3();
+                        for (let i = 0; i < pos.count; i++) {
+                            v.fromBufferAttribute(pos, i);
+                            v.applyMatrix4(child.matrixWorld);
+                            vertices.push(v.x, v.y, v.z);
+                        }
+                    }
+                });
+
+                // Spawn
+                const startPos = new THREE.Vector3(x, y, z);
+                model.position.copy(startPos);
+                scene.add(model);
+
+                const targetMixer = new THREE.AnimationMixer(model);
+                if (gltf.animations.length > 2) {
+                    targetMixer.clipAction(gltf.animations[2]).play();
+                }
+
+                const bodyDesc = RAPIER.RigidBodyDesc.kinematicPositionBased()
+                    .setTranslation(startPos.x, startPos.y, startPos.z);
+                const body = world.createRigidBody(bodyDesc);
+
+                const colliderDesc = RAPIER.ColliderDesc.convexHull(new Float32Array(vertices))
+                    .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
+                const collider = world.createCollider(colliderDesc, body);
+
+                // Push to the array with Name and ID included
+                gltfTargets.push({
+                    model, body, collider, active: true, grounded: false,
+                    mixer: targetMixer, name, id
+                });
+            });
+        }
+
+        // --- ANIMATED FBX TARGETS ---
+        function setupFBXTarget(url, name, id, x, y, z) {
+            const loader = new FBXLoader();
+            loader.load(url, (fbx) => {
+                const model = fbx;
+
+                // Mixamo FBX models are usually built in centimeters. Scale down to meters.
+                model.scale.set(0.01, 0.01, 0.01);
+                model.position.set(0, 0, 0);
+                model.updateMatrixWorld(true);
+
+                // Extract local vertices for the Rapier Convex Hull
+                const vertices = [];
+                model.traverse((child) => {
+                    if (child.isMesh) {
+                        const pos = child.geometry.attributes.position;
+                        const v = new THREE.Vector3();
+                        for (let i = 0; i < pos.count; i++) {
+                            v.fromBufferAttribute(pos, i);
+                            v.applyMatrix4(child.matrixWorld);
+                            vertices.push(v.x, v.y, v.z);
+                        }
+                    }
+                });
+
+                // Spawn at the explicit x, y, z coordinates
+                const startPos = new THREE.Vector3(x, y, z);
+                model.position.copy(startPos);
+                scene.add(model);
+
+                // Start the FBX animation (Usually index 0)
+                const targetMixer = new THREE.AnimationMixer(model);
+                if (fbx.animations && fbx.animations.length > 0) {
+                    targetMixer.clipAction(fbx.animations[0]).play();
+                }
+
+                // Create Kinematic Physics Body
+                const bodyDesc = RAPIER.RigidBodyDesc.kinematicPositionBased()
+                    .setTranslation(startPos.x, startPos.y, startPos.z);
+                const body = world.createRigidBody(bodyDesc);
+
+                const colliderDesc = RAPIER.ColliderDesc.convexHull(new Float32Array(vertices))
+                    .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
+                const collider = world.createCollider(colliderDesc, body);
+
+                // Push into the exact same array as GLTFs. The render loop handles it automatically!
+                gltfTargets.push({
+                    model, body, collider, active: true, grounded: false,
+                    mixer: targetMixer, name, id
+                });
+            });
+        }
+
+        // --- TENNIS TARGET SETUP ---
+        function setupTennisTarget() {
+            const group = new THREE.Group();
+            const colors = [0x2288ee, 0xffffff, 0x2288ee, 0xffffff, 0xffbb00]; // Blue/White/Gold
+
+            for (let i = 0; i < 5; i++) {
+                const radius = 0.4 - (i * 0.08);
+                const ring = new THREE.Mesh(
+                    new THREE.CylinderGeometry(radius, radius, 0.02, 32),
+                    new THREE.MeshStandardMaterial({ color: colors[i], roughness: 0.6 })
+                );
+                ring.rotation.x = Math.PI / 2;
+                ring.position.z = i * 0.005;
+                group.add(ring);
+            }
+
+            const startPos = new THREE.Vector3(0, 0.5, -3.0);
+            group.position.copy(startPos);
+            scene.add(group);
+
+            // Enable CCD on the target body so it catches high-speed balls
+            const bodyDesc = RAPIER.RigidBodyDesc.kinematicPositionBased()
+                .setTranslation(startPos.x, startPos.y, startPos.z)
+                .setCcdEnabled(true);
+            const body = world.createRigidBody(bodyDesc);
+
+            const physicsRotation = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI / 2);
+
+            const colliderDesc = RAPIER.ColliderDesc.cylinder(0.25, 0.4)
+                .setRotation(physicsRotation)
+                .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
+            const collider = world.createCollider(colliderDesc, body);
+
+            tennisTarget = { mesh: group, body, collider, origin: startPos, name: "Lower Tennis Target" };
+        }
+
+        // --- SWORD SETUP ---
+        function setupSword() {
+            swordGroup = new THREE.Group();
+            swordGroup.visible = false;
+            scene.add(swordGroup);
+
+            const bodyDesc = RAPIER.RigidBodyDesc.kinematicPositionBased()
+                .setTranslation(0, -10, 0)
+                .setCcdEnabled(true);
+            swordBody = world.createRigidBody(bodyDesc);
+
+            setSwordState(0); // Initialize as Katana
+        }
+
+        function setSwordState(newState) {
+            swordState = newState;
+
+            // Clean up visual meshes
+            while (swordGroup.children.length > 0) {
+                swordGroup.remove(swordGroup.children[0]);
+            }
+
+            // Clean up old Rigid Sword Collider
+            if (swordCollider) {
+                world.removeCollider(swordCollider, false);
+                swordCollider = null;
+            }
+
+            // Clean up old Whip Physics Links
+            if (whipLinks.length > 0) {
+                whipLinks.forEach(link => {
+                    world.removeRigidBody(link.body); // Automatically cleans up attached joints and colliders
+                    scene.remove(link.mesh);
+                });
+                whipLinks = [];
+            }
+
+            let handleLength, bladeLength, bladeYPos, modeName;
+
+            // --- WHIP MODE ---
+            if (swordState === 3) {
+                handleLength = 0.15;
+                modeName = "Whip (Dynamic)";
+                swordGroup.rotation.set(0, 0, 0);
+
+                const handleGeo = new THREE.CylinderGeometry(0.015, 0.015, handleLength);
+                const handle = new THREE.Mesh(handleGeo, new THREE.MeshStandardMaterial({ color: 0x333333 }));
+                handle.position.y = 0.0;
+                swordGroup.add(handle);
+
+                const numLinks = 8;
+                const linkLength = 0.12;
+                const linkRadius = 0.015;
+                const halfExt = Math.max(0.01, (linkLength * 0.9 - linkRadius * 2) / 2);
+
+                let prevBody = swordBody;
+                let parentAnchor = new RAPIER.Vector3(0, handleLength / 2, 0);
+
+                const basePos = swordBody.translation();
+
+                for (let i = 0; i < numLinks; i++) {
+                    const isTip = (i === numLinks - 1);
+                    const color = isTip ? 0xff2222 : 0x22aa22;
+
+                    const linkGeo = new THREE.CapsuleGeometry(linkRadius, linkLength - linkRadius * 2, 4, 8);
+                    const linkMat = new THREE.MeshStandardMaterial({ color: color, roughness: 0.6 });
+                    const linkMesh = new THREE.Mesh(linkGeo, linkMat);
+                    scene.add(linkMesh);
+
+                    const spawnY = basePos.y + (handleLength / 2) + (i * linkLength) + (linkLength / 2);
+
+                    // 0.4 Gravity keeps it hanging forward naturally without artificial forces!
+                    // 2.5 resists bending and flopping, giving the whip structural stiffness!
+                    const bodyDesc = RAPIER.RigidBodyDesc.dynamic()
+                        .setTranslation(basePos.x, spawnY, basePos.z)
+                        .setLinearDamping(0.5)
+                        .setAngularDamping(2.5)
+                        .setGravityScale(0.4)
+                        .setCcdEnabled(isTip); // CRITICAL: Turn this off for the whip! On substepped at least
+                    const linkBody = world.createRigidBody(bodyDesc);
+
+                    // Good momentum. Heavy tip (10.0) pulls the lighter cord (3.0) for a whip crack.
+                    const linkDensity = isTip ? 10.0 : 3.0;
+
+                    const colDesc = RAPIER.ColliderDesc.capsule(halfExt, linkRadius)
+                        .setDensity(linkDensity)
+                        .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
+                    const linkCollider = world.createCollider(colDesc, linkBody);
+
+                    const jointParams = RAPIER.JointData.spherical(
+                        parentAnchor,
+                        new RAPIER.Vector3(0, -linkLength / 2, 0)
+                    );
+                    world.createImpulseJoint(jointParams, prevBody, linkBody, true);
+
+                    whipLinks.push({ body: linkBody, collider: linkCollider, mesh: linkMesh, isTip, index: i });
+
+                    prevBody = linkBody;
+                    parentAnchor = new RAPIER.Vector3(0, linkLength / 2, 0);
+                }
+
+                if (fireMode === 'sword') updateHUD("Weapon Stance", modeName);
+                return;
+            }
+
+            // --- RIGID BLADE MODES (Katana / Daggers) ---
+            if (swordState === 0) {
+                handleLength = 0.2; // Full katana handle
+                bladeLength = 0.8;
+                bladeYPos = 0.1 + (bladeLength / 2); // Extends upward
+                modeName = "Katana (Full)";
+            } else if (swordState === 1) {
+                handleLength = 0.1; // Half-size handle
+                bladeLength = 0.25;
+                bladeYPos = 0.05 + (bladeLength / 2); // Extends upward (underhand)
+                modeName = "Dagger (Underhand)";
+            } else {
+                handleLength = 0.1; // Half-size handle
+                bladeLength = 0.25;
+                bladeYPos = -0.05 - (bladeLength / 2); // Extends downward from bottom (overhand)
+                modeName = "Dagger (Overhand)";
+            }
+
+            swordGroup.rotation.set(0, 0, 0);
+
+            // Handle centered on grip (y = 0)
+            const handleGeo = new THREE.CylinderGeometry(0.015, 0.015, handleLength);
+            const handle = new THREE.Mesh(handleGeo, new THREE.MeshStandardMaterial({ color: 0x333333 }));
+            handle.position.y = 0.0;
+
+            // Generate Gradient Texture for the Blade
+            const canvas = document.createElement('canvas');
+            canvas.width = 64; canvas.height = 256;
+            const ctx = canvas.getContext('2d');
+            const grad = ctx.createLinearGradient(0, 0, 0, 256);
+            if (swordState === 2) {
+                grad.addColorStop(0, '#0000ff');   // Blue Base (near handle)
+                grad.addColorStop(0.5, '#00ff00'); // Green Mid
+                grad.addColorStop(1, '#ff0000');   // Red Tip (at bottom)
+            } else {
+                grad.addColorStop(0, '#ff0000');   // Red Tip (Top)
+                grad.addColorStop(0.5, '#00ff00'); // Green Mid
+                grad.addColorStop(1, '#0000ff');   // Blue Base (Bottom)
+            }
+            ctx.fillStyle = grad;
+            ctx.fillRect(0, 0, 64, 256);
+            const bladeTex = new THREE.CanvasTexture(canvas);
+            bladeTex.colorSpace = THREE.SRGBColorSpace;
+
+            let bladeGeo;
+            if (swordState === 2) bladeGeo = new THREE.CylinderGeometry(0.025, 0.015, bladeLength, 8);
+            else if (swordState === 1) bladeGeo = new THREE.CylinderGeometry(0.015, 0.025, bladeLength, 8);
+            else bladeGeo = new THREE.CylinderGeometry(0.015, 0.03, bladeLength, 8);
+
+            const blade = new THREE.Mesh(bladeGeo, new THREE.MeshStandardMaterial({ map: bladeTex, roughness: 0.2 }));
+            blade.position.y = bladeYPos;
+
+            swordGroup.add(handle);
+            swordGroup.add(blade);
+
+            const colDesc = RAPIER.ColliderDesc.capsule(bladeLength / 2, swordState === 0 ? 0.03 : 0.025)
+                .setTranslation(0, bladeYPos, 0)
+                .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS)
+                .setActiveCollisionTypes(RAPIER.ActiveCollisionTypes.DEFAULT | RAPIER.ActiveCollisionTypes.KINEMATIC_KINEMATIC);
+            swordCollider = world.createCollider(colDesc, swordBody);
+
+            if (fireMode === 'sword') updateHUD("Weapon Stance", modeName);
+        }
+
+        // --- SWORD DUMMY SETUP ---
+        function setupSwordDummy() {
+            const height = 1.6; // ~5'3" tall
+            const radius = 0.2;
+
+            const geo = new THREE.CylinderGeometry(radius, radius, height, 16);
+            const mat = new THREE.MeshStandardMaterial({ color: 0xffaa00, roughness: 0.6 });
+            const mesh = new THREE.Mesh(geo, mat);
+
+            // Placed to your front-left for easy right-handed swinging
+            const startPos = new THREE.Vector3(-0.8, 2.0, -1.0);
+            mesh.position.copy(startPos);
+            scene.add(mesh);
+
+            const bodyDesc = RAPIER.RigidBodyDesc.kinematicPositionBased()
+                .setTranslation(startPos.x, startPos.y, startPos.z);
+            const body = world.createRigidBody(bodyDesc);
+
+            const colDesc = RAPIER.ColliderDesc.cylinder(height / 2, radius)
+                .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS)
+                .setActiveCollisionTypes(RAPIER.ActiveCollisionTypes.DEFAULT | RAPIER.ActiveCollisionTypes.KINEMATIC_KINEMATIC);
+            const collider = world.createCollider(colDesc, body);
+
+            swordDummy = { mesh, body, collider, origin: startPos, grounded: false, name: "Training Dummy" };
+        }
+
+        function setupShield() {
+            const shieldGeo = new THREE.CylinderGeometry(0.35, 0.35, 0.02, 32);
+            const shieldMat = new THREE.MeshStandardMaterial({
+                color: 0x00aaff,
+                transparent: false,
+                roughness: 0.1,
+                metalness: 0.9
+            });
+
+            shieldMesh = new THREE.Mesh(shieldGeo, shieldMat);
+
+            // Unified rotation & translation offset
+            const shieldRotX = Math.PI / 6;
+            const shieldPosX = 0, shieldPosY = -0.18, shieldPosZ = -0.02;
+
+            shieldMesh.rotation.x = shieldRotX;
+            shieldMesh.position.set(shieldPosX, shieldPosY, shieldPosZ);
+            shieldGroup.add(shieldMesh);
+
+            shieldGroup.visible = false;
+            scene.add(shieldGroup);
+
+            const bodyDesc = RAPIER.RigidBodyDesc.kinematicPositionBased()
+                .setCcdEnabled(true);
+            shieldBody = world.createRigidBody(bodyDesc);
+
+            // Match physics collider rotation exactly to visual mesh rotation
+            const physicsRot = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), shieldRotX);
+
+            // Cylinder collider matching radius 0.35 and thickness
+            const colDesc = RAPIER.ColliderDesc.cylinder(0.01, 0.35)
+                .setTranslation(shieldPosX, shieldPosY, shieldPosZ)
+                .setRotation(physicsRot)
+                .setRestitution(0.8)
+                .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
+
+            shieldCollider = world.createCollider(colDesc, shieldBody);
+            shieldBody.setTranslation({ x: 0, y: -10, z: 0 }, true);
+        }
+
+        // --- VIRTUAL MIRROR SETUP ---
+        function setupMirror() {
+            const mirrorGeo = new THREE.PlaneGeometry(1.5, 2.0);
+            const mirror = new Reflector(mirrorGeo, {
+                clipBias: 0.003,
+                textureWidth: window.innerWidth * window.devicePixelRatio, // or 1024x1024
+                textureHeight: window.innerHeight * window.devicePixelRatio,
+                color: 0x889999
+            });
+
+            mirror.position.set(-2, 0.2, 2.5);
+            mirror.rotation.y = (5 * Math.PI) / 6;
+            scene.add(mirror);
+
+            const frameGeo = new THREE.BoxGeometry(1.6, 2.1, 0.1);
+            const frameMat = new THREE.MeshStandardMaterial({ color: 0x222222 });
+            const frame = new THREE.Mesh(frameGeo, frameMat);
+
+            frame.position.copy(mirror.position);
+            frame.position.add(new THREE.Vector3(0, 0, -0.06).applyQuaternion(mirror.quaternion));
+            frame.quaternion.copy(mirror.quaternion);
+            scene.add(frame);
+
+            const bodyDesc = RAPIER.RigidBodyDesc.fixed()
+                .setTranslation(frame.position.x, frame.position.y, frame.position.z)
+                .setRotation(frame.quaternion);
+            const body = world.createRigidBody(bodyDesc);
+            const colDesc = RAPIER.ColliderDesc.cuboid(0.8, 1.05, 0.05)
+                .setRestitution(0.9); // High bounciness
+            world.createCollider(colDesc, body);
+        }
+
+        // ---
+
+        // --- FIRING LOGIC ---
+        function fireWeapon() {
+             // The gun trigger does nothing in paddle mode, in sword swing mode, and in shield mode
+            if (fireMode === 'paddle' || fireMode === 'sword' || fireMode === 'shield') return;
+
+            const spawnPos = new THREE.Vector3();
+            const quat = new THREE.Quaternion();
+            weaponGroup.getWorldPosition(spawnPos);
+            weaponGroup.getWorldQuaternion(quat);
+
+            const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(quat).normalize();
+            spawnPos.addScaledVector(forward, 0.2); // Offset past barrel tip
+
+            if (fireMode === 'ball') {
+                const vel = forward.multiplyScalar(6);
+                const desc = RAPIER.RigidBodyDesc.dynamic().setTranslation(spawnPos.x, spawnPos.y, spawnPos.z).setLinvel(vel.x, vel.y, vel.z).setCcdEnabled(true);
+                const body = world.createRigidBody(desc);
+                const colDesc = RAPIER.ColliderDesc.ball(0.02).setRestitution(0.95).setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
+                const collider = world.createCollider(colDesc, body);
+
+                // Use cached geometry and material
+                const mesh = new THREE.Mesh(ballGeo, ballMat);
+                scene.add(mesh);
+                projectiles.push({ body, collider, mesh, spawnTime: performance.now(), type: 'ball', hasBounced: false });
+            } else { // laser
+                const vel = forward.multiplyScalar(20);
+                const desc = RAPIER.RigidBodyDesc.dynamic()
+                    .setTranslation(spawnPos.x, spawnPos.y, spawnPos.z)
+                    .setRotation(quat) // Align physics body to weapon angle
+                    .setLinvel(vel.x, vel.y, vel.z)
+                    .setGravityScale(0)
+                    .setCcdEnabled(true);
+                const body = world.createRigidBody(desc);
+
+                // Lay the physics capsule flat on the Z-axis (matches the visual mesh)
+                const capsuleRot = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI / 2);
+                const colDesc = RAPIER.ColliderDesc.capsule(0.05, 0.01)
+                    .setRotation(capsuleRot)
+                    .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
+                const collider = world.createCollider(colDesc, body);
+
+                const mesh = new THREE.Mesh(laserGeo, laserMat);
+                scene.add(mesh);
+                projectiles.push({ body, collider, mesh, spawnTime: performance.now(), type: 'laser', hasBounced: false });
+            }
+        }
+
+        // --- REAL WORLD MESHES ---
+        function processRealWorldMeshes(frame, referenceSpace) {
+            if (!frame.detectedMeshes) return;
+            const activeMeshes = new Set();
+
+            frame.detectedMeshes.forEach(xrMesh => {
+                activeMeshes.add(xrMesh);
+                const pose = frame.getPose(xrMesh.meshSpace, referenceSpace);
+                if (!pose) return;
+
+                if (!xrMeshes.has(xrMesh)) {
+                    const colliderDesc = RAPIER.ColliderDesc.trimesh(xrMesh.vertices, xrMesh.indices).setRestitution(0.8);
+                    const rigidBodyDesc = RAPIER.RigidBodyDesc.fixed()
+                        .setTranslation(pose.transform.position.x, pose.transform.position.y, pose.transform.position.z)
+                        .setRotation(pose.transform.orientation);
+                    const rigidBody = world.createRigidBody(rigidBodyDesc);
+                    world.createCollider(colliderDesc, rigidBody);
+
+                    const geometry = new THREE.BufferGeometry();
+                    geometry.setAttribute('position', new THREE.BufferAttribute(xrMesh.vertices, 3));
+                    geometry.setIndex(new THREE.BufferAttribute(xrMesh.indices, 1));
+
+                    const edgesGeo = new THREE.EdgesGeometry(geometry);
+                    const outlineMesh = new THREE.LineSegments(edgesGeo, new THREE.LineBasicMaterial({ color: 0x00ffcc }));
+                    const mesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ color: 0x002222, transparent: true, opacity: 0.3, depthWrite: false }));
+
+                    mesh.add(outlineMesh);
+                    mesh.position.copy(pose.transform.position);
+                    mesh.quaternion.copy(pose.transform.orientation);
+                    mesh.visible = meshesVisible;
+                    scene.add(mesh);
+
+                    xrMeshes.set(xrMesh, { rigidBody, mesh });
+                } else {
+                    const data = xrMeshes.get(xrMesh);
+                    data.rigidBody.setTranslation(pose.transform.position, true);
+                    data.rigidBody.setRotation(pose.transform.orientation, true);
+                    data.mesh.position.copy(pose.transform.position);
+                    data.mesh.quaternion.copy(pose.transform.orientation);
+                }
+            });
+
+            for (const [xrMesh, data] of xrMeshes.entries()) {
+                if (!activeMeshes.has(xrMesh)) {
+                    world.removeRigidBody(data.rigidBody);
+                    scene.remove(data.mesh);
+                    xrMeshes.delete(xrMesh);
+                }
+            }
+        }
+
+        // --- GAME LOOP ---
+        function render(timestamp, frame) {
+            const dt = clock.getDelta();
+            if (dt > 0.5) return; // Resume fix prevents massive time jumps, and controller failure, if you take the headset off
+
+            const now = performance.now();
+            const timeSeconds = now * 0.001;
+
+            let rightGripHeld = false;
+
+            // Track Left Hand Velocity for throwing mechanics
+            if (leftController) {
+                const currentPos = new THREE.Vector3();
+                leftController.getWorldPosition(currentPos);
+
+                // Check lengthSq to ensure it's not the (0,0,0) initialization frame
+                if (dt > 0 && leftPrevPos.lengthSq() > 0.001) {
+                    leftVelocity.subVectors(currentPos, leftPrevPos).divideScalar(dt);
+                }
+                leftPrevPos.copy(currentPos);
+            }
+
+            if (frame) {
+                const session = renderer.xr.getSession();
+                let aPressed = false, bPressed = false;
+                let leftGripPressed = false;
+                let leftXPressed = false;
+                let leftYPressed = false;
+                let leftThumbstickPressed = false;
+
+                // Poll Gamepads for button presses
+                if (session && session.inputSources) {
+                    for (const source of session.inputSources) {
+                        if (source.gamepad) {
+                            const b = source.gamepad.buttons;
+                            if (source.handedness === 'right') {
+                                if (b.length > 4 && b[4].pressed) aPressed = true;
+                                if (b.length > 5 && b[5].pressed) bPressed = true;
+                                if (b.length > 1 && b[1].pressed) rightGripHeld = true; // Middle-finger squeeze held
+                            } else if (source.handedness === 'left') {
+                                if (b.length > 1 && b[1].pressed) leftGripPressed = true;
+                                if (b.length > 4 && b[4].pressed) leftXPressed = true;
+                                if (b.length > 5 && b[5].pressed) leftYPressed = true;
+                                if (b.length > 3 && b[3].pressed) leftThumbstickPressed = true;
+                            }
+                        }
+                    }
+                }
+
+                // A Button: Context-Aware (Toggle Pointer or Cycle 4 Sword Stances)
+                if (aPressed && !aWasPressed) {
+                    if (fireMode === 'sword') {
+                        swordState = (swordState + 1) % 4;
+                        setSwordState(swordState);
+                    } else {
+                        pointerVisible = !pointerVisible;
+                        pointerLine.visible = pointerVisible;
+                    }
+                }
+                aWasPressed = aPressed;
+
+                // B Button: Toggle Fire Mode (Ball -> Laser -> Paddle -> Shield -> Sword)
+                if (bPressed && !bWasPressed) {
+                    if (fireMode === 'ball') fireMode = 'laser';
+                    else if (fireMode === 'laser') fireMode = 'paddle';
+                    else if (fireMode === 'paddle') fireMode = 'shield';
+                    else if (fireMode === 'shield') fireMode = 'sword';
+                    else fireMode = 'ball';
+
+                    weaponGroup.visible = (fireMode === 'ball' || fireMode === 'laser');
+                    paddleGroup.visible = (fireMode === 'paddle');
+                    shieldGroup.visible = (fireMode === 'shield');
+                    swordGroup.visible = (fireMode === 'sword');
+
+                    if (fireMode !== 'paddle') paddleBody.setTranslation({x: 0, y: -10, z: 0}, true);
+                    if (fireMode !== 'shield') {
+                        shieldBody.setTranslation({x: 0, y: -10, z: 0}, true);
+                        trainingLauncherActive = false; // Turn off launcher when exiting shield/paddle
+                    }
+
+                    if (fireMode !== 'sword') {
+                        swordBody.setTranslation({x: 0, y: -10, z: 0}, true);
+                        whipLinks.forEach(l => {
+                            l.body.setTranslation({x: 0, y: -10, z: 0}, true);
+                            l.body.setLinvel({x: 0, y: 0, z: 0}, true);
+                            if (l.mesh) l.mesh.visible = false;
+                        });
+                    } else if (rightGrip) {
+                        const gripPos = new THREE.Vector3();
+                        rightGrip.getWorldPosition(gripPos);
+                        swordBody.setTranslation(gripPos, true);
+                        whipLinks.forEach((l, i) => {
+                            l.body.setTranslation({x: gripPos.x, y: gripPos.y + 0.1 + (i * 0.15), z: gripPos.z}, true);
+                            l.body.setLinvel({x: 0, y: 0, z: 0}, true);
+                        });
+                        setSwordState(swordState);
+                    }
+
+                    const modeTexts = {
+                        'ball': 'Bouncy Balls',
+                        'laser': 'Laser Ray',
+                        'paddle': 'Tennis Paddle',
+                        'shield': 'Shield',
+                        'sword': 'Melee Weapons'
+                    };
+                    updateHUD("Mode Switched", `Mode: ${modeTexts[fireMode]}`);
+                }
+                bWasPressed = bPressed;
+
+                // Contextual Left Controller Actions (Active in Paddle or Shield mode)
+                if (fireMode === 'shield' || fireMode === 'paddle') {
+                    // Toggle Shield Absorption mode with Left Y button if in shield mode
+                    if (fireMode === 'shield' && leftYPressed && !leftYWasPressed) {
+                        shieldAbsorbMode = !shieldAbsorbMode;
+                        updateHUD("Shield Mode", shieldAbsorbMode ? "Absorb (Vaporize)" : "Deflect (Bounce)");
+                    }
+
+                    // Toggle Training Launcher from Dummy using Left Thumbstick Click (L3)
+                    if (leftThumbstickPressed && !leftThumbstickWasPressed) {
+                        trainingLauncherActive = !trainingLauncherActive;
+                        updateHUD("Dummy Launcher", trainingLauncherActive ? "Active (Firing)" : "Disabled");
+                    }
+                }
+                leftYWasPressed = leftYPressed;
+                leftThumbstickWasPressed = leftThumbstickPressed;
+
+                // Left X Button: Toggle Avatar Visibility
+                if (leftXPressed && !leftXWasPressed) {
+                    avatarVisible = !avatarVisible;
+                    // Toggle visibility for the head and both hands
+                    avatarMeshes.forEach(mesh => {
+                        if (mesh) mesh.visible = avatarVisible;
+                    });
+                    // updateHUD("Avatar", avatarVisible ? "Visible in Game & Mirror" : "Hidden");
+                }
+                leftXWasPressed = leftXPressed;
+
+                // Left Grip: Toggle Room Meshes
+                if (leftGripPressed && !leftGripWasPressed) {
+                    meshesVisible = !meshesVisible;
+                    for (const data of xrMeshes.values()) data.mesh.visible = meshesVisible;
+                }
+                leftGripWasPressed = leftGripPressed;
+
+                const referenceSpace = renderer.xr.getReferenceSpace();
+                processRealWorldMeshes(frame, referenceSpace);
+
+                // --- FIND THE TRUE SEMANTIC FLOOR ---
+                if (frame.detectedPlanes) {
+                    frame.detectedPlanes.forEach(plane => {
+                        if (plane.semanticLabel === 'floor' && !physicsFloorCreated) {
+                            const pose = frame.getPose(plane.planeSpace, referenceSpace);
+                            if (pose) {
+                                physicsFloorY = pose.transform.position.y; // Save height globally
+
+                                const floorBodyDesc = RAPIER.RigidBodyDesc.fixed().setTranslation(0, physicsFloorY - 0.05, 0);
+                                const floorBody = world.createRigidBody(floorBodyDesc);
+                                const floorColliderDesc = RAPIER.ColliderDesc.cuboid(10, 0.05, 10).setRestitution(0.8);
+                                world.createCollider(floorColliderDesc, floorBody);
+
+                                physicsFloorCreated = true;
+                            }
+                        }
+                    });
+                }
+
+                // Snap ANY ungrounded targets if the floor exists
+                if (physicsFloorY !== null) {
+                    gltfTargets.forEach(t => {
+                        if (t.active && !t.grounded) {
+                            const currentPos = t.body.translation();
+                            const snappedPos = new THREE.Vector3(currentPos.x, physicsFloorY, currentPos.z);
+
+                            t.body.setNextKinematicTranslation(snappedPos);
+                            t.model.position.copy(snappedPos);
+                            t.grounded = true;
+                        }
+                    });
+
+                    if (swordDummy && !swordDummy.grounded) {
+                        const height = 1.6;
+                        // Center Y is floor height + half the dummy's height
+                        const snappedPos = new THREE.Vector3(swordDummy.origin.x, physicsFloorY + (height / 2), swordDummy.origin.z);
+
+                        swordDummy.body.setNextKinematicTranslation(snappedPos);
+                        swordDummy.mesh.position.copy(snappedPos);
+                        swordDummy.grounded = true;
+                    }
+                }
+            }
+
+            // --- GESTURE CASTING SYSTEM LOGIC ---
+            if (rightGripHeld) {
+                const camWorldPos = camera.getWorldPosition(new THREE.Vector3());
+                const camEuler = new THREE.Euler().setFromQuaternion(camera.getWorldQuaternion(new THREE.Quaternion()), 'YXZ');
+                // Body Quat locks the Yaw so targets stay in front of you, but ignores pitch/roll so looking down doesn't ruin the stance
+                const bodyQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), camEuler.y);
+
+                function getBodyRelative(offset) {
+                    const vec = new THREE.Vector3(offset[0], offset[1], offset[2]);
+                    vec.applyQuaternion(bodyQuat);
+                    return camWorldPos.clone().add(vec);
+                }
+
+                let leftPos = new THREE.Vector3();
+                let leftActive = false;
+                if (leftController) {
+                    leftController.getWorldPosition(leftPos);
+                    leftActive = true;
+                }
+
+                let rightPos = new THREE.Vector3();
+                let rightActive = false;
+                if (rightGrip) {
+                    rightGrip.getWorldPosition(rightPos);
+                    rightActive = true;
+                }
+
+                // Hide all by default, we will un-hide the needed ones
+                gestureIndicators.forEach(ind => ind.visible = false);
+                let indicatorIdx = 0;
+
+                const isCooldown = (now - lastSpellCastTime < 1500);
+
+                if (isCooldown) {
+                    // COOLDOWN STATE: Show all starting nodes as FAINT RED
+                    for (let s = 0; s < spellSequences.length; s++) {
+                        const step0 = spellSequences[s].steps[0];
+                        if (step0.left) {
+                            const ind = gestureIndicators[indicatorIdx++];
+                            ind.position.copy(getBodyRelative(step0.left));
+                            ind.material.color.setHex(0xff0000); // Red
+                            ind.material.opacity = 0.15; // Faint
+                            ind.visible = true;
+                        }
+                        if (step0.right) {
+                            const ind = gestureIndicators[indicatorIdx++];
+                            ind.position.copy(getBodyRelative(step0.right));
+                            ind.material.color.setHex(0xff0000); // Red
+                            ind.material.opacity = 0.15; // Faint
+                            ind.visible = true;
+                        }
+                    }
+                } else {
+                    if (activeSpellIndex === null) {
+                        // IDLE STATE: Show starting nodes in their respective Spell Colors
+                        for (let s = 0; s < spellSequences.length; s++) {
+                            const spell = spellSequences[s];
+                            const step0 = spell.steps[0];
+                            let allHandsMatched = true;
+
+                            if (step0.left) {
+                                const targetWorld = getBodyRelative(step0.left);
+                                const ind = gestureIndicators[indicatorIdx++];
+                                ind.position.copy(targetWorld);
+                                ind.material.color.setHex(spell.color);
+                                ind.material.opacity = 0.4;
+                                ind.visible = true;
+                                if (!leftActive || leftPos.distanceTo(targetWorld) > TARGET_RADIUS) allHandsMatched = false;
+                            }
+                            if (step0.right) {
+                                const targetWorld = getBodyRelative(step0.right);
+                                const ind = gestureIndicators[indicatorIdx++];
+                                ind.position.copy(targetWorld);
+                                ind.material.color.setHex(spell.color);
+                                ind.material.opacity = 0.4;
+                                ind.visible = true;
+                                if (!rightActive || rightPos.distanceTo(targetWorld) > TARGET_RADIUS) allHandsMatched = false;
+                            }
+
+                            if (allHandsMatched) {
+                                if (spell.steps.length === 1) {
+                                    // Instantly cast 1-step spells
+                                    updateHUD("SPELL CASTED!", spell.name);
+                                    playHaptic('left', 1.0, 200);
+                                    playHaptic('right', 1.0, 200);
+                                    activeSpellIndex = null;
+                                    lastSpellCastTime = now;
+                                } else {
+                                    // Start multi-step sequence
+                                    activeSpellIndex = s;
+                                    currentSpellStep = 1;
+                                    spellStartTime = now;
+                                    playHaptic('left', 0.3, 50);
+                                    playHaptic('right', 0.3, 50);
+                                }
+                                break;
+                            }
+                        }
+                    } else {
+                        // ACTIVE STATE: Tracking a specific sequence
+                        if (now - spellStartTime > GESTURE_TIMEOUT) {
+                            activeSpellIndex = null; // Silent timeout, return to idle
+                        } else {
+                            const spell = spellSequences[activeSpellIndex];
+                            const step = spell.steps[currentSpellStep];
+                            let allHandsMatched = true;
+
+                            if (step.left) {
+                                const targetWorld = getBodyRelative(step.left);
+                                const ind = gestureIndicators[indicatorIdx++];
+                                ind.position.copy(targetWorld);
+                                ind.material.color.setHex(spell.color);
+                                ind.material.opacity = 0.7; // Brighten the active target
+                                ind.visible = true;
+                                if (!leftActive || leftPos.distanceTo(targetWorld) > TARGET_RADIUS) allHandsMatched = false;
+                            }
+                            if (step.right) {
+                                const targetWorld = getBodyRelative(step.right);
+                                const ind = gestureIndicators[indicatorIdx++];
+                                ind.position.copy(targetWorld);
+                                ind.material.color.setHex(spell.color);
+                                ind.material.opacity = 0.7; // Brighten the active target
+                                ind.visible = true;
+                                if (!rightActive || rightPos.distanceTo(targetWorld) > TARGET_RADIUS) allHandsMatched = false;
+                            }
+
+                            if (allHandsMatched) {
+                                currentSpellStep++;
+                                spellStartTime = now;
+
+                                if (currentSpellStep >= spell.steps.length) {
+                                    updateHUD("SPELL CASTED!", spell.name);
+                                    playHaptic('left', 1.0, 200);
+                                    playHaptic('right', 1.0, 200);
+                                    activeSpellIndex = null;
+                                    lastSpellCastTime = now;
+                                } else {
+                                    // Satisfying intermediate click
+                                    playHaptic('left', 0.3, 50);
+                                    playHaptic('right', 0.3, 50);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // RESET IF GRIP RELEASED
+                if (activeSpellIndex !== null) {
+                    activeSpellIndex = null;
+                    currentSpellStep = 0;
+                }
+                gestureIndicators.forEach(ind => ind.visible = false);
+            }
+
+            // ==========================================
+            // --- EAT / DRINK SYSTEM LOGIC ---
+            // ==========================================
+
+            // 1. Calculate the physical "Mouth" position
+            // Roughly 15cm down and 7cm forward from the headset camera (eyes)
+            const headsetPos = camera.getWorldPosition(new THREE.Vector3());
+            const headsetQuat = camera.getWorldQuaternion(new THREE.Quaternion());
+            const mouthPos = headsetPos.clone().add(
+                new THREE.Vector3(0, -0.15, -0.07).applyQuaternion(headsetQuat)
+            );
+
+            // Helper to process each hand independently
+            function processConsume(trackObj, currentState, handName) {
+                if (!trackObj) return 0;
+
+                const handPos = new THREE.Vector3();
+                trackObj.getWorldPosition(handPos);
+
+                const dist = handPos.distanceTo(mouthPos);
+                const EAT_RADIUS = 0.15; // 15cm activation bubble around the mouth
+
+                if (dist < EAT_RADIUS) {
+                    // We are at the mouth! Now check the wrist angle.
+                    const quat = trackObj.getWorldQuaternion(new THREE.Quaternion());
+                    const forwardVector = new THREE.Vector3(0, 0, -1).applyQuaternion(quat);
+                    const upVector = new THREE.Vector3(0, 1, 0).applyQuaternion(quat);
+
+                    // Calculate the exact direction from the hand to the headset
+                    const toHeadset = headsetPos.clone().sub(handPos).normalize();
+
+                    // "Eat" is the default for most angles.
+                    // "Drink" triggers ONLY if:
+                    // 1. Angled toward the headset (forward vector aligns with your face)
+                    // 2. Deeply angled outward (top of the controller is tilted sideways > 78 degrees or down)
+                    const pointsAtHead = forwardVector.dot(toHeadset) > 0.85;
+                    const deeplyAngledOutward = upVector.y < 0.0;
+
+                    const isDrinking = pointsAtHead || deeplyAngledOutward;
+                    const newState = isDrinking ? 2 : 1;
+
+                    // Trigger only when the state officially changes (Away -> Eat, Away -> Drink, or Eat -> Drink)
+                    if (newState !== currentState) {
+                        if (now - lastConsumeTime > 400) { // Slight throttle to prevent double-firing
+                            updateHUD(newState === 2 ? "Drank!" : "Ate!", `${handName} Hand`);
+                            playHaptic(handName.toLowerCase(), 0.8, 150);
+                            lastConsumeTime = now;
+                        }
+                        return newState; // Lock in the new state
+                    }
+                    return currentState; // Maintain current state
+                } else if (dist > EAT_RADIUS + 0.02) {
+                    // 5cm hysteresis outer-margin to prevent flickering on the edge
+                    return 0;
+                }
+
+                return currentState;
+            }
+
+            // Process both hands every frame
+            leftConsumeState = processConsume(leftController, leftConsumeState, "Left");
+            rightConsumeState = processConsume(rightGrip, rightConsumeState, "Right");
+
+            // ---
+
+            // --- SHIELD POSITION SYNC (Left Hand) ---
+            if (fireMode === 'shield') {
+                const leftGripObj = renderer.xr.getControllerGrip(0); // Left grip
+                if (leftGripObj) {
+                    const gripPos = new THREE.Vector3();
+                    const gripQuat = new THREE.Quaternion();
+                    leftGripObj.getWorldPosition(gripPos);
+                    leftGripObj.getWorldQuaternion(gripQuat);
+
+                    shieldGroup.position.copy(gripPos);
+                    shieldGroup.quaternion.copy(gripQuat);
+                    shieldBody.setTranslation(gripPos, true);
+                    shieldBody.setRotation(gripQuat, true);
+                }
+            }
+
+            // --- TRAINING BALL LAUNCHER (Paddle & Shield Modes) ---
+            if ((fireMode === 'shield' || fireMode === 'paddle') && trainingLauncherActive) {
+                if (now - lastLauncherSpawn > 2000) { // Fire every 2 seconds
+                    lastLauncherSpawn = now;
+
+                    const spawnPos = swordDummy.mesh.position.clone(); // Originates from dummy
+                    const camPos = camera.getWorldPosition(new THREE.Vector3());
+
+                    const ballMesh = new THREE.Mesh(ballGeo, ballMat);
+                    scene.add(ballMesh);
+
+                    const bodyDesc = RAPIER.RigidBodyDesc.dynamic().setTranslation(spawnPos.x, spawnPos.y, spawnPos.z);
+                    const body = world.createRigidBody(bodyDesc);
+                    const colDesc = RAPIER.ColliderDesc.ball(0.06).setRestitution(0.7);
+                    const collider = world.createCollider(colDesc, body);
+
+                    // Fires directly from the dummy toward the player's head
+                    const velocity = camPos.clone().sub(spawnPos).normalize().multiplyScalar(6.0);
+                    body.setLinvel(velocity, true);
+
+                    projectiles.push({ body: body, collider: collider, mesh: ballMesh, spawnTime: now, type: 'ball', hasBounced: false });
+                }
+            }
+
+            // Animate Targets / Step World
+            // --- DYNAMICALLY KEEP TARGETS OUT OF WALLS ---
+            const cameraPos = camera.getWorldPosition(new THREE.Vector3());
+
+            targets.forEach(t => {
+                // 1. Raycast from the headset toward the target's desired position
+                const dir = new THREE.Vector3().subVectors(t.desiredOrigin, cameraPos).normalize();
+                const maxDist = t.desiredOrigin.distanceTo(cameraPos);
+
+                const ray = new RAPIER.Ray(
+                    { x: cameraPos.x, y: cameraPos.y, z: cameraPos.z },
+                    { x: dir.x, y: dir.y, z: dir.z }
+                );
+
+                // Query the physics world (ONLY_FIXED ensures we only hit the physical room meshes)
+                const hit = world.castRay(ray, maxDist, true, 0xFFFFFFFF, RAPIER.QueryFilterFlags.ONLY_FIXED);
+
+                if (hit && hit.toi < maxDist) {
+                    // WALL DETECTED: Reel the target forward by 40cm so it floats in front of the wall
+                    const safeDist = Math.max(0.5, hit.toi - 0.4); // Maintain at least 0.5m from the player
+                    t.origin.copy(cameraPos).addScaledVector(dir, safeDist);
+                } else {
+                    // PATH CLEAR: Return target to its default desired position
+                    t.origin.copy(t.desiredOrigin);
+                }
+
+                // 2. Animate the target around its newly calculated safe origin
+                const pos = t.origin.clone();
+                if (t.moveType === 'slow') pos.x += Math.sin(timeSeconds * 1.5 + t.timeOffset) * 0.8;
+                if (t.moveType === 'fast') pos.x += Math.sin(timeSeconds * 4.0 + t.timeOffset) * 1.2;
+
+                t.body.setNextKinematicTranslation(pos);
+                t.mesh.position.copy(pos);
+            });
+
+            // --- SYNC ADDITIONAL TENNIS TARGET ---
+            if (tennisTarget) {
+                const tPos = tennisTarget.body.translation();
+                tennisTarget.mesh.position.set(tPos.x, tPos.y, tPos.z);
+            }
+
+            // --- SYNC PADDLE PHYSICS ---
+            if (fireMode === 'paddle' && rightGrip) {
+                const gripPos = new THREE.Vector3();
+                const gripQuat = new THREE.Quaternion();
+                rightGrip.getWorldPosition(gripPos);
+                rightGrip.getWorldQuaternion(gripQuat);
+
+                const pitch = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2);
+                gripQuat.multiply(pitch);
+
+                // FIX 1: Calculate the exact velocity and direction of the racket head
+                const currentHeadPos = new THREE.Vector3(0, 0.22, 0).applyQuaternion(gripQuat).add(gripPos);
+                if (dt > 0) {
+                    paddleVelocity.subVectors(currentHeadPos, headPrevPos).divideScalar(dt);
+                }
+                headPrevPos.copy(currentHeadPos);
+
+                paddleBody.setNextKinematicTranslation(gripPos);
+                paddleBody.setNextKinematicRotation(gripQuat);
+
+                paddleGroup.position.copy(gripPos);
+                paddleGroup.quaternion.copy(gripQuat);
+            }
+
+            // --- SYNC SWORD PHYSICS ---
+            if (fireMode === 'sword' && rightGrip) {
+                const gripPos = new THREE.Vector3();
+                const gripQuat = new THREE.Quaternion();
+                rightGrip.getWorldPosition(gripPos);
+                rightGrip.getWorldQuaternion(gripQuat);
+
+                const pitch = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2);
+                gripQuat.multiply(pitch);
+
+                const bladeLength = (swordState === 0) ? 0.8 : 0.25;
+                const bladeMidY = (swordState === 2) ? -0.175 : ((swordState === 0) ? 0.5 : 0.175);
+                const bladeMidPos = new THREE.Vector3(0, bladeMidY, 0).applyQuaternion(gripQuat).add(gripPos);
+                if (dt > 0) swordVelocity.subVectors(bladeMidPos, swordPrevPos).divideScalar(dt);
+                swordPrevPos.copy(bladeMidPos);
+
+                swordBody.setNextKinematicTranslation(gripPos);
+                swordBody.setNextKinematicRotation(gripQuat);
+
+                swordGroup.position.copy(gripPos);
+                swordGroup.quaternion.copy(gripQuat);
+
+                // Sync all dynamic whip links to their visual meshes
+                if (whipLinks.length > 0) {
+                    whipLinks.forEach(link => {
+                        const pos = link.body.translation();
+                        const rot = link.body.rotation();
+                        link.mesh.position.set(pos.x, pos.y, pos.z);
+                        link.mesh.quaternion.set(rot.x, rot.y, rot.z, rot.w);
+                        // Relies strictly on low gravity and the heavy tip to keep the whip floating outward.
+                    });
+                }
+            }
+
+            // --- SHIELD PROXIMITY SAFETY NET ---
+            function checkShieldProximity() {
+                if (fireMode === 'shield' && shieldMesh) {
+                    shieldMesh.getWorldPosition(_meshWorldPos);
+                    shieldMesh.getWorldQuaternion(_meshWorldQuat);
+                    _meshWorldQuatInv.copy(_meshWorldQuat).invert();
+
+                    for (let i = projectiles.length - 1; i >= 0; i--) {
+                        const p = projectiles[i];
+                        if (p.isDestroyed) continue;
+
+                        const trans = p.body.translation();
+                        _projWorldPos.set(trans.x, trans.y, trans.z);
+
+                        _localPos.copy(_projWorldPos)
+                            .sub(_meshWorldPos)
+                            .applyQuaternion(_meshWorldQuatInv);
+
+                        // 1. EXACT CYLINDRICAL RADIUS CHECK
+                        // Shield radius (0.35) + Ball radius (0.02) + Slight edge margin (0.01)
+                        const radialDist = Math.hypot(_localPos.x, _localPos.z);
+                        if (radialDist > 0.38) continue;
+
+                        // 2. TIGHT CYLINDRICAL DEPTH CHECK
+                        // Negative Y is the front face (0.0 to -0.01 is the physical surface).
+                        // We allow an 8cm window (-0.08) to catch balls moving 11cm per frame at 20m/s.
+                        // This eliminates the 40cm false-positive dead zone entirely.
+                        if (_localPos.y < -0.08 || _localPos.y > 0.05) {
+                            continue;
+                        }
+
+                        if (!p.hapticTriggered) {
+                            p.hapticTriggered = true;
+                            const linvel = p.body.linvel();
+                            const speed = Math.hypot(linvel.x, linvel.y, linvel.z);
+
+                            if (shieldAbsorbMode) {
+                                p.isDestroyed = true;
+                                world.removeRigidBody(p.body);
+                                scene.remove(p.mesh);
+                                playHaptic('left', 0.8, 150);
+                                updateHUD("Shield Absorbed", `Speed: ${speed.toFixed(1)} m/s`);
+                            } else {
+                                playHaptic('left', 1.0, 250);
+                                updateHUD("Shield Deflected!", `Speed: ${speed.toFixed(1)} m/s`);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ------
+
+            // ==========================================
+            // --- PHYSICS EXECUTION BRANCH (SUPPORTS SUBSTEPPING) ---
+            // ==========================================
+
+            if (USE_ACCUMULATOR) {
+                // --- MODE A: 180Hz Sub-Stepped Accumulator ---
+                const dtMax = Math.min(dt, 0.033);
+                physicsAccumulator += dtMax;
+                let stepCount = 0;
+
+                while (physicsAccumulator >= world.timestep && stepCount < 3) {
+                    world.step(eventQueue);
+                    processPhysicsEvents();
+                    checkShieldProximity();
+                    physicsAccumulator -= world.timestep;
+                    stepCount++;
+                }
+                if (stepCount >= 3) physicsAccumulator = 0;
+
+            } else {
+                // --- MODE B: Plain 90Hz Unstepped ---
+                // Simply step the world exactly once per render frame
+                world.step(eventQueue);
+                processPhysicsEvents();
+                checkShieldProximity();
+            }
+
+            // ==========================================
+            // --- UPDATE ANIMATIONS (GLTF & FBX) ---
+            // ==========================================
+            gltfTargets.forEach(t => {
+                if (t.active && t.mixer) {
+                    t.mixer.update(dt);
+                }
+            });
+
+            // ==========================================
+            // --- VISUAL SYNC & GARBAGE COLLECTION ---
+            // ==========================================
+            for (let i = projectiles.length - 1; i >= 0; i--) {
+                const p = projectiles[i];
+
+                // If it was marked dead in the physics loops, splice it out and move on!
+                if (p.isDestroyed) {
+                    projectiles.splice(i, 1);
+                    continue;
+                }
+
+                const trans = p.body.translation();
+                const rot = p.body.rotation();
+
+                p.mesh.position.set(trans.x, trans.y, trans.z);
+                p.mesh.quaternion.set(rot.x, rot.y, rot.z, rot.w);
+
+                const age = now - p.spawnTime;
+                const maxAge = p.type === 'laser' ? 2000 : 10000;
+
+                // Timeout Cleanup
+                if (trans.y < -5 || age > maxAge) {
+                    world.removeRigidBody(p.body);
+                    scene.remove(p.mesh);
+                    projectiles.splice(i, 1);
+                }
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        // --- DRAIN COLLISIONS INSIDE THE SUB-STEP ---
+        function processPhysicsEvents() {
+            eventQueue.drainCollisionEvents((handle1, handle2, started) => {
+                if (!started) return;
+
+                const projIndex = projectiles.findIndex(p => p.collider.handle === handle1 || p.collider.handle === handle2);
+                if (projIndex !== -1) {
+                    const proj = projectiles[projIndex];
+                    if (proj.isDestroyed) return; // CRITICAL: Prevent Use-After-Free crashes
+
+                    const otherHandle = (proj.collider.handle === handle1) ? handle2 : handle1;
+
+                    // 1. PADDLE HIT
+                    if (paddleCollider && otherHandle === paddleCollider.handle) {
+                        proj.hasBounced = false;
+                        const headLocal = new THREE.Vector3(0, 0.22, 0);
+                        const headPos = headLocal.applyQuaternion(paddleGroup.quaternion).add(paddleGroup.position);
+
+                        const paddleForward = new THREE.Vector3(0, 0, -1).applyQuaternion(paddleGroup.quaternion).normalize();
+                        const paddleBack = new THREE.Vector3(0, 0, 1).applyQuaternion(paddleGroup.quaternion).normalize();
+
+                        const ballPos = proj.body.translation();
+                        const toBall = new THREE.Vector3(ballPos.x - headPos.x, ballPos.y - headPos.y, ballPos.z - headPos.z);
+                        const isForehand = paddleVelocity.length() > 0.5
+                            ? paddleVelocity.dot(paddleForward) > 0
+                            : toBall.dot(paddleForward) > 0;
+
+                        const strikeNormal = isForehand ? paddleForward : paddleBack;
+                        const safePos = headPos.clone().add(strikeNormal.clone().multiplyScalar(0.04));
+                        proj.body.setTranslation(safePos, true);
+
+                        const vel = proj.body.linvel();
+                        let speed = Math.hypot(vel.x, vel.y, vel.z);
+
+                        const age = performance.now() - proj.spawnTime;
+                        if (age < 150) speed = 1.0;
+                        else {
+                            const swingSpeed = paddleVelocity.length();
+                            if (speed < swingSpeed * 1.5) speed = swingSpeed * 1.5;
+                            if (speed < 2.5) speed = 2.5;
+                            if (speed > 25) speed = 25;
+                        }
+
+                        proj.body.setLinvel({
+                            x: strikeNormal.x * speed,
+                            y: strikeNormal.y * speed,
+                            z: strikeNormal.z * speed
+                        }, true);
+
+                        if (rightGrip) {
+                            const session = renderer.xr.getSession();
+                            if (session && session.inputSources) {
+                                for (const source of session.inputSources) {
+                                    if (source.handedness === 'right' && source.gamepad?.hapticActuators?.length > 0) {
+                                        source.gamepad.hapticActuators[0].pulse(1.0, 50);
+                                    }
+                                }
+                            }
+                        }
+                        return;
+                    }
+
+                    // 2. SHIELD HIT
+                    if (fireMode === 'shield' && shieldCollider && shieldBody && shieldMesh && otherHandle === shieldCollider.handle) {
+                        const linvel = proj.body.linvel();
+                        const speed = Math.hypot(linvel.x, linvel.y, linvel.z);
+
+                        if (shieldAbsorbMode) {
+                            proj.isDestroyed = true; // Flag for clean garbage collection
+                            world.removeRigidBody(proj.body);
+                            scene.remove(proj.mesh);
+                            playHaptic('left', 0.8, 150);
+                            updateHUD("Shield Absorbed", `Speed: ${speed.toFixed(1)} m/s`);
+                        } else {
+                            playHaptic('left', 1.0, 250);
+                            updateHUD("Shield Deflected!", `Speed: ${speed.toFixed(1)} m/s`);
+                        }
+                        return;
+                    }
+
+                    // 3. GLTF & FBX TARGET HIT
+                    const hitGltf = gltfTargets.find(t => t.active && t.collider.handle === otherHandle);
+                    if (hitGltf) {
+                        if (!proj.hasBounced) {
+                            updateHUD("TARGET ELIMINATED", `ID: ${hitGltf.id} | Name: ${hitGltf.name}`);
+                            scene.remove(hitGltf.model);
+                            world.removeRigidBody(hitGltf.body);
+                            hitGltf.active = false;
+
+                            proj.isDestroyed = true;
+                            world.removeRigidBody(proj.body);
+                            scene.remove(proj.mesh);
+                        }
+                        return;
+                    }
+
+                    // 4. BULLSEYE TARGET HIT
+                    const target = targets.find(t => t.collider.handle === otherHandle);
+                    if (target) {
+                        const targetPos = target.body.translation();
+                        const hitPos = proj.body.translation();
+                        const dist = Math.hypot(targetPos.x - hitPos.x, targetPos.y - hitPos.y);
+                        const score = Math.max(0, 100 - (dist / 0.3) * 100);
+
+                        let rank = score > 90 ? "BULLSEYE!" : (score > 60 ? "Great Hit!" : "OK");
+                        updateHUD(`${rank} (${target.name})`, `Score: ${score.toFixed(0)} | Precision: ${(dist * 100).toFixed(1)}cm`);
+
+                        proj.isDestroyed = true;
+                        world.removeRigidBody(proj.body);
+                        scene.remove(proj.mesh);
+                        return;
+                    }
+
+                    // 5. TENNIS TARGET HIT
+                    if (tennisTarget && tennisTarget.collider.handle === otherHandle) {
+                        const vel = proj.body.linvel();
+                        const impactSpeed = Math.hypot(vel.x, vel.y, vel.z).toFixed(1);
+
+                        const targetPos = tennisTarget.body.translation();
+                        const hitPos = proj.body.translation();
+                        const dist = Math.hypot(targetPos.x - hitPos.x, targetPos.y - hitPos.y);
+                        const score = Math.max(0, 100 - (dist / 0.4) * 100);
+
+                        let rank = proj.hasBounced ? "Bounced Hit" : "Direct Smash!";
+                        if(score > 90) rank = "ACE! (Bullseye)";
+
+                        updateHUD(rank, `Speed: ${impactSpeed}m/s | Precision: ${(dist * 100).toFixed(1)}cm`);
+
+                        proj.isDestroyed = true;
+                        world.removeRigidBody(proj.body);
+                        scene.remove(proj.mesh);
+                        return;
+                    }
+
+                    // 6. FLOOR OR WALL HIT
+                    proj.hasBounced = true;
+                    if (proj.type === 'laser') {
+                        proj.isDestroyed = true;
+                        world.removeRigidBody(proj.body);
+                        scene.remove(proj.mesh);
+                    }
+                }
+
+                // 7. WHIP HIT EVENT (Unaffected by projectile logic)
+                if (fireMode === 'sword' && swordState === 3) {
+                    const hitWhipLink = whipLinks.find(l => l.collider.handle === handle1 || l.collider.handle === handle2);
+                    if (hitWhipLink) {
+                        const otherHandle = (hitWhipLink.collider.handle === handle1) ? handle2 : handle1;
+                        if (swordDummy && swordDummy.collider.handle === otherHandle) {
+                            const now = performance.now();
+                            if (now - lastSwordHitTime > 250) {
+                                lastSwordHitTime = now;
+                                const vel = hitWhipLink.body.linvel();
+                                const speed = Math.hypot(vel.x, vel.y, vel.z);
+                                const hitColor = hitWhipLink.isTip ? "Red Tip" : "Green Cord";
+                                const strokeType = hitWhipLink.isTip ? "WHIP CRACK!" : "WHIP WRAP";
+
+                                updateHUD(`${hitColor} | ${strokeType}`, `Link: ${hitWhipLink.index + 1}/${whipLinks.length} | Spd: ${speed.toFixed(1)}m/s`);
+
+                                if (rightGrip) {
+                                    const session = renderer.xr.getSession();
+                                    if (session?.inputSources) {
+                                        for (const source of session.inputSources) {
+                                            if (source.handedness === 'right' && source.gamepad?.hapticActuators?.length > 0) {
+                                                const force = hitWhipLink.isTip ? 1.0 : 0.4;
+                                                source.gamepad.hapticActuators[0].pulse(force, 100);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 8. SWORD HIT EVENT (Unaffected by projectile logic)
+                if (fireMode === 'sword' && swordCollider && swordState !== 3 && (handle1 === swordCollider.handle || handle2 === swordCollider.handle)) {
+                    const otherHandle = (handle1 === swordCollider.handle) ? handle2 : handle1;
+
+                    if (swordDummy && swordDummy.collider.handle === otherHandle) {
+                        const now = performance.now();
+
+                        // 250ms Cooldown prevents spamming hits as the blade passes through the dummy
+                        if (now - lastSwordHitTime > 250) {
+                            lastSwordHitTime = now;
+
+                            // 1. Calculate Velocity & Swing Normal
+                            const speed = swordVelocity.length();
+                            const swingNormal = speed > 0 ? swordVelocity.clone().normalize() : new THREE.Vector3(0,0,1);
+
+                            // 2. EXTRACT PITCH, YAW, ROLL (Sword Orientation)
+                            const euler = new THREE.Euler().setFromQuaternion(swordGroup.quaternion, 'YXZ');
+                            const pitchDeg = Math.round(THREE.MathUtils.radToDeg(euler.x));
+                            const yawDeg = Math.round(THREE.MathUtils.radToDeg(euler.y));
+                            const rollDeg = Math.round(THREE.MathUtils.radToDeg(euler.z));
+
+                            // 3. Calculate Stroke Type (0=Stab, 90=Chop)
+                            const bladeVector = new THREE.Vector3(0, 1, 0).applyQuaternion(swordGroup.quaternion).normalize();
+                            let angleDeg = bladeVector.angleTo(swingNormal) * (180 / Math.PI);
+                            if (angleDeg > 90) angleDeg = 180 - angleDeg;
+
+                            // 4. Determine Specific Strike Zone (Red Tip vs Green Mid vs Blue Base)
+                            // Even inside the physics event, we can use the world position to find the local hit spot!
+                            const dummyPos = swordDummy.body.translation();
+                            const localHit = swordGroup.worldToLocal(new THREE.Vector3(dummyPos.x, dummyPos.y, dummyPos.z));
+
+                            let hitColor = "Blue Base";
+                            if (swordState === 2) { // Dagger Overhand
+                                const distFromBase = Math.abs(localHit.y + 0.05);
+                                if (distFromBase > 0.20) hitColor = "Red Tip";
+                                else if (distFromBase > 0.10) hitColor = "Green Mid";
+                            } else { // Katana or Dagger Underhand
+                                const bladeLength = (swordState === 0) ? 0.8 : 0.25;
+                                const baseLine = swordState === 0 ? 0.1 : 0.05;
+                                const distFromBase = localHit.y - baseLine;
+                                if (distFromBase > bladeLength * 0.75) hitColor = "Red Tip";
+                                else if (distFromBase > bladeLength * 0.40) hitColor = "Green Mid";
+                            }
+
+                            const stabThreshold = (hitColor === "Red Tip") ? 45 : 30;
+                            const strokeType = angleDeg > 60 ? "CHOP" : (angleDeg < stabThreshold ? "STAB" : "SLICE");
+
+                            // 5. EDGE ALIGNMENT (True Edge vs Flat Slap)
+                            const trueEdge = new THREE.Vector3(0, 0, -1).applyQuaternion(swordGroup.quaternion).normalize();
+                            const flatSide = new THREE.Vector3(1, 0, 0).applyQuaternion(swordGroup.quaternion).normalize();
+
+                            const edgeDot = Math.abs(swingNormal.dot(trueEdge));
+                            const flatDot = Math.abs(swingNormal.dot(flatSide));
+
+                            let edgeQuality = "Flat Slap";
+                            if (edgeDot > flatDot) {
+                                edgeQuality = edgeDot > 0.85 ? "Perfect Edge" : "Glancing Edge";
+                            }
+
+                            // 6. SWING PATH (Direction of the swing)
+                            const dirY = swingNormal.y > 0.3 ? "Up" : (swingNormal.y < -0.3 ? "Down" : "Level");
+                            const dirX = swingNormal.x > 0.3 ? "Right" : (swingNormal.x < -0.3 ? "Left" : "Center");
+                            const swingPath = `${dirY}-${dirX}`;
+
+                            // 7. FIRE HUD & HAPTICS
+                            updateHUD(
+                                `${hitColor} | ${strokeType} | ${edgeQuality}`,
+                                `P:${pitchDeg}° Y:${yawDeg}° R:${rollDeg}° | ${swingPath} | ${speed.toFixed(0)}m/s`
+                            );
+
+                            if (rightGrip) {
+                                const session = renderer.xr.getSession();
+                                if (session && session.inputSources) {
+                                    for (const source of session.inputSources) {
+                                        if (source.handedness === 'right' && source.gamepad?.hapticActuators?.length > 0) {
+                                            const hapticForce = edgeDot > flatDot ? 1.0 : 0.3;
+                                            source.gamepad.hapticActuators[0].pulse(hapticForce, 100);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        return;
+                    }
+                }
+            });
+        }
+
+        // ---
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+    </script>
+</body>
+</html>

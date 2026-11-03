@@ -1,0 +1,1911 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Quest 3 AR Music Studio</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body { margin: 0; overflow: hidden; background: #111; color: white; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        #info { position: absolute; top: 20px; left: 20px; z-index: 100; pointer-events: none; text-shadow: 1px 1px 2px black; background: rgba(0,0,0,0.5); padding: 15px; border-radius: 8px; }
+        h1 { margin: 0 0 10px 0; font-size: 22px; color: #ff0077; }
+        p { margin: 0; line-height: 1.6; font-size: 14px; }
+        .highlight { color: #00ffcc; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <!--
+    To run:
+    adb reverse tcp:8080 tcp:8080
+    npx serve -p 8080
+    -->
+    <div id="info">
+        <h1>Quest 3 AR Audio Studio</h1>
+        <p>
+        1. Open in Meta Quest Browser & <span class="highlight">Enter AR</span>.<br/>
+        2. <span class="highlight">PLAY & PERCUSSION</span>: Pinch/tap the 16-pad sampler, 4-octave piano keyboard, customizable bongo kits, or swipe through the interactive harp.<br/>
+        3. <span class="highlight">KINETIC SHAKER</span>: Pinch near the red egg shaker to pick it up and shake it physically in space.<br/>
+        4. <span class="highlight">STUDIO TOOLS</span>: Use the in-VR UI desk to toggle the metronome, record into 4 independent looper tracks, or route live vocals via microphone.<br/>
+        5. <span class="highlight">DAW & EXPORT</span>: View real-time piano rolls and audio waveforms floating above your workspace, and automatically export multi-track WebM stems and JSON telemetry upon completion.
+        </p>
+    </div>
+
+    <!-- Import Maps -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+        import { XRHandModelFactory } from 'three/addons/webxr/XRHandModelFactory.js';
+
+        let scene, camera, renderer, clock;
+        let hand1, hand2;
+        let handModelFactory;
+        let worldGroup;
+        
+        // --- CORE AUDIO & PHYSICS ---
+        let audioCtx, compressor;
+        let bongos = [];
+        let pianoKeys = [];
+        let harpStrings = [];
+        const fingerData = new Map(); 
+        
+        // --- HUD ---
+        let hudCanvas, hudContext, hudTexture, hudMesh;
+        const hitLogs = [];
+
+        // --- TRACKING DICTIONARIES ---
+        const STRING_JOINTS = {
+            'wrist': 'Heel',
+            'middle-finger-phalanx-proximal': 'Palm', 
+            'thumb-tip': 'Thumb',
+            'index-finger-tip': 'Index',
+            'middle-finger-tip': 'Middle',
+            'ring-finger-tip': 'Ring',
+            'pinky-finger-tip': 'Pinky'
+        };
+
+        const NUMERIC_JOINTS = { 4: 'Thumb', 9: 'Index', 14: 'Middle', 19: 'Ring', 24: 'Pinky' };
+
+        const XR_JOINT_NAMES = [
+            'wrist', 'thumb-metacarpal', 'thumb-phalanx-proximal', 'thumb-phalanx-distal', 'thumb-tip',
+            'index-finger-metacarpal', 'index-finger-phalanx-proximal', 'index-finger-phalanx-intermediate', 'index-finger-phalanx-distal', 'index-finger-tip',
+            'middle-finger-metacarpal', 'middle-finger-phalanx-proximal', 'middle-finger-phalanx-intermediate', 'middle-finger-phalanx-distal', 'middle-finger-tip',
+            'ring-finger-metacarpal', 'ring-finger-phalanx-proximal', 'ring-finger-phalanx-intermediate', 'ring-finger-phalanx-distal', 'ring-finger-tip',
+            'pinky-finger-metacarpal', 'pinky-finger-phalanx-proximal', 'pinky-finger-phalanx-intermediate', 'pinky-finger-phalanx-distal', 'pinky-finger-tip'
+        ];
+
+        let useStringJoints = true; 
+        let rightThumbstickPressed = false;
+        let hitMode = 'advanced'; 
+        let leftThumbstickPressed = false;
+        let leftThumbstickXPressed = false; 
+        
+        const jointDotGeo = new THREE.SphereGeometry(0.005, 8, 8);
+        const jointDotMat = new THREE.MeshBasicMaterial({ color: 0x00ffcc, depthTest: false }); 
+        let showJointDots = false;
+        let leftXButtonPressed = false; 
+
+        const handCooldowns = new Map(); 
+
+        // --- 1. MODULAR INSTRUMENTS & KITS ---
+        let currentKitIndex = 0;
+        let currentKeyModeIndex = 0;
+        let currentHarpModeIndex = 0;
+        let currentShakerModeIndex = 0;
+
+        const DRUM_KITS = [
+            { name: "CLASSIC BONGO", freqMacho: 400, freqHembra: 250, edgePitchShift: 100, decayTip: 0.4, decayFlesh: 0.6, fleshOctaveDrop: 0.5, pitchBend: 1.5, colorMacho: 0xdd9955, colorHembra: 0xbb7733, headColor: 0xffeedd },
+            { name: "DEEP CONGA", freqMacho: 200, freqHembra: 130, edgePitchShift: 50, decayTip: 0.5, decayFlesh: 0.9, fleshOctaveDrop: 0.5, pitchBend: 1.2, colorMacho: 0x8b4513, colorHembra: 0x5c2e0b, headColor: 0xeeddcc },
+            { name: "STEEL TIMBALES", freqMacho: 600, freqHembra: 450, edgePitchShift: 200, decayTip: 0.5, decayFlesh: 0.3, fleshOctaveDrop: 0.8, pitchBend: 1.1, colorMacho: 0xaaaaaa, colorHembra: 0x999999, headColor: 0xffffff },
+            { name: "SYNTH 808", freqMacho: 150, freqHembra: 60, edgePitchShift: 0, decayTip: 0.8, decayFlesh: 1.2, fleshOctaveDrop: 1.0, pitchBend: 3.0, colorMacho: 0x222222, colorHembra: 0x111111, headColor: 0x00ffcc }
+        ];
+
+        const KEY_MODES = [
+            { name: "E-PIANO", type1: 'triangle', type2: 'sine' },
+            { name: "8-BIT", type1: 'square', type2: 'square' },
+            { name: "SAWTOOTH", type1: 'sawtooth', type2: 'sawtooth' }
+        ];
+
+        const HARP_MODES = [
+            { name: "CLASSICAL", osc1: 'triangle', osc2: 'sine', decay: 2.5, filterMult: 8 },
+            { name: "NYLON", osc1: 'triangle', osc2: 'triangle', decay: 1.2, filterMult: 3 }, 
+            { name: "SYNTH-PLUCK", osc1: 'sawtooth', osc2: 'sine', decay: 3.0, filterMult: 12 } 
+        ];
+
+        const SHAKER_MODES = [
+            { name: "EGG SHAKER", baseFreq: 3000, freqMultiplier: 250, q: 2.0, decay: 0.1 },
+            { name: "MARACAS", baseFreq: 1500, freqMultiplier: 100, q: 1.0, decay: 0.15 }, 
+            { name: "BRIGHT SAND", baseFreq: 6000, freqMultiplier: 400, q: 3.5, decay: 0.05 } 
+        ];
+
+        // --- SAMPLER PAD STATE ---
+        let samplerPads = [];
+        const PAD_DEFS = [
+            { name: 'KICK_SUB', color: 0xaa0000, active: 0xff4444, sound: 'kick', freq: 50 },
+            { name: 'SNARE_NOISE', color: 0xcc6600, active: 0xffaa44, sound: 'snare', freq: 200 },
+            { name: 'HIHAT_CLICK', color: 0xaaaa00, active: 0xffff44, sound: 'hihat', freq: 1000 },
+            { name: 'ZAP_8BIT', color: 0x00aa00, active: 0x44ff44, sound: 'zap', freq: 800 },
+            { name: 'DRONE_C2', color: 0x00aaaa, active: 0x44ffff, sound: 'drone', freq: 65.41 },
+            { name: 'DRONE_G2', color: 0x0044aa, active: 0x4488ff, sound: 'drone', freq: 98.00 },
+            { name: 'FM_BELL_C3', color: 0x0000aa, active: 0x6666ff, sound: 'fm', freq: 130.81 },
+            { name: 'FM_BELL_G3', color: 0x6600aa, active: 0xaa44ff, sound: 'fm', freq: 196.00 },
+            { name: 'CHORD_C4', color: 0xaa00aa, active: 0xff44ff, sound: 'chord', freq: 261.63 },
+            { name: 'CHORD_F4', color: 0xaa0066, active: 0xff44aa, sound: 'chord', freq: 349.23 },
+            { name: 'CHORD_G4', color: 0x660022, active: 0xaa4466, sound: 'chord', freq: 392.00 },
+            { name: 'RISER_FX', color: 0xaaaaaa, active: 0xffffff, sound: 'riser', freq: 200 },
+            { name: 'GLITCH_LOW', color: 0x666666, active: 0xaaaaaa, sound: 'glitch', freq: 200 },
+            { name: 'GLITCH_HI', color: 0x333333, active: 0x888888, sound: 'glitch', freq: 800 },
+            { name: 'IMPACT_LOW', color: 0x004400, active: 0x44aa44, sound: 'impact', freq: 80 },
+            { name: 'IMPACT_SUB', color: 0x440000, active: 0xaa4444, sound: 'impact', freq: 40 }
+        ];
+
+        // --- SUSTAIN STATE (KEYS & PADS) ---
+        let useKeySustain = true; 
+        let pushKeysDown = false; // Only highlight by default
+        const activeFingers = new Map();     
+        const activeSustainKeys = new Map(); 
+
+        // --- 2. MENU & UI STATE ---
+        let vrButtons = [];
+        let transportButtons = [];
+        let metroUIButtons = [];
+        let looperUIButtons = [];
+        let globalMenuCooldown = 0; 
+        let menuGroup;
+
+        // --- 3. RECORDING & EXPORT STATE ---
+        let isRecording = false;
+        let recordingStartTime = 0;
+        let recordedAudioBlob = null;
+        let recordedAudioURL = null;
+        let splitExportMode = false; // Default to single merged file
+        let streamNodes = {}; 
+        let recorders = {};   
+        let trackChunks = {}; 
+        let sessionTelemetry = []; 
+        let playbackAudioElement = null;
+        let playbackSourceNode = null;
+        let isPlayingBack = false;
+        let playbackStartTime = 0;
+        
+        let aButtonPressed = false; 
+        let bButtonPressed = false; 
+        let lastHudUpdateTime = 0;  
+
+        // --- METRONOME CONFIG STATE ---
+        let bpm = 120;
+        let isMetronomeOn = false;
+        let recordMetronome = false;    
+        let metronomeEmphasis = false;  
+        let currentMetroModeIndex = 0; 
+        let lastBeatTime = 0;
+        let beatCount = 0; 
+        const METRO_MODES = [
+            { name: "DIGITAL", type: 'sine', freq1: 1500, freq2: 1000, decay: 0.05 },
+            { name: "WOODBLOCK", type: 'triangle', freq1: 800, freq2: 600, decay: 0.08 },
+            { name: "808 COW", type: 'square', freq1: 800, freq2: 540, decay: 0.15 }
+        ];
+
+        // --- MULTI-TRACK LOOPER STATE ---
+        const NUM_LOOPERS = 4;
+        const loopers = Array.from({ length: NUM_LOOPERS }, () => ({
+            state: 'EMPTY', audioBuffer: null, telemetry: [], durationMs: 0,
+            sourceNode: null, gainNode: null, playStartTime: 0, lastLoopTime: undefined
+        }));
+        let looperDest = null;
+        let looperRecorder = null;
+        let looperChunks = [];
+        let activeRecLoopIndex = -1; 
+
+        // --- VOCAL MICROPHONE STATE ---
+        let isMicActive = false;
+        let micStream = null;
+        let micSourceNode = null;
+        let micGainNode = null;
+
+        // --- VIDEO RECORDING STATE ---
+        let mrRecorder;
+        let mrChunks = [];
+
+        // --- IN-VR DAW VIEWER ---
+        let viewerGroup, viewerCanvas, viewerCtx, viewerTexture;
+        let viewerMesh, playheadMesh;
+        let viewerDurationMs = 0;
+        const VIEWER_WIDTH = 2.0;
+
+        // --- KINETIC SHAKER STATE ---
+        let shakerMesh;
+        let shakerBasePos = new THREE.Vector3(-0.35, 0.35, -0.4);
+        let holdingHandUUID = null; 
+        let noiseBuffer; 
+
+        init();
+
+        function init() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+            clock = new THREE.Clock();
+
+            worldGroup = new THREE.Group();
+            scene.add(worldGroup);
+
+            scene.add(new THREE.AmbientLight(0xffffff, 1.0));
+            const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+            dirLight.position.set(0, 5, 2);
+            scene.add(dirLight);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            renderer.xr.setReferenceSpaceType('local-floor');
+            document.body.appendChild(renderer.domElement);
+
+            const arBtn = ARButton.createButton(renderer, { requiredFeatures: ['local-floor', 'hand-tracking'] });
+            document.body.appendChild(arBtn);
+
+            renderer.xr.addEventListener('sessionstart', () => {
+                initAudioEngine();
+            });
+
+            setupHands();
+            setupBongos();
+            setupKeyboard();
+            setupPads();
+            setupShaker();
+            setupHarp();
+            setupMenus();
+            setupHUD();
+            setupVRViewer();
+
+            renderer.setAnimationLoop(render);
+        }
+
+        // ==========================================
+        // 1. PROCEDURAL PHYSICS AUDIO ENGINE
+        // ==========================================
+        function initAudioEngine() {
+            if (!audioCtx) {
+                const AudioContext = window.AudioContext || window.webkitAudioContext;
+                audioCtx = new AudioContext();
+
+                compressor = audioCtx.createDynamicsCompressor();
+                compressor.threshold.setValueAtTime(-10, audioCtx.currentTime); 
+                compressor.knee.setValueAtTime(10, audioCtx.currentTime);
+                compressor.ratio.setValueAtTime(12, audioCtx.currentTime); 
+                compressor.attack.setValueAtTime(0, audioCtx.currentTime);
+                compressor.release.setValueAtTime(0.1, audioCtx.currentTime);
+                compressor.connect(audioCtx.destination); 
+
+                // ADD ALL NEW TRACKS: vocals, metronome, looper, pads
+                ['mix', 'drums', 'keys', 'shaker', 'harp', 'vocals', 'metronome', 'looper', 'pads'].forEach(track => {
+                    streamNodes[track] = audioCtx.createMediaStreamDestination();
+                });
+                compressor.connect(streamNodes.mix);
+
+                // Setup the isolated Looper Destination Bus
+                looperDest = audioCtx.createMediaStreamDestination();
+            }
+
+            const bufferSize = audioCtx.sampleRate * 2.0; 
+            noiseBuffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+            const output = noiseBuffer.getChannelData(0);
+            for (let i = 0; i < bufferSize; i++) {
+                output[i] = Math.random() * 2 - 1;
+            }
+
+            // --- METRONOME AUDIO & TELEMETRY ---
+            window.playMetronomeTick = function(isBeatOne) {
+                if (!audioCtx) return;
+                
+                const mode = METRO_MODES[currentMetroModeIndex];
+                const isDownbeat = isBeatOne && metronomeEmphasis; 
+                
+                // Add a 10ms scheduling lookahead to guarantee the attack envelope plays
+                const t = audioCtx.currentTime + 0.02;
+                const osc = audioCtx.createOscillator();
+                const gain = audioCtx.createGain();
+                
+                osc.type = mode.type;
+                osc.frequency.setValueAtTime(isDownbeat ? mode.freq1 : mode.freq2, t); 
+                
+                const attack = 0.005;
+                gain.gain.setValueAtTime(0, t);
+                gain.gain.linearRampToValueAtTime(0.6, t + attack);
+                gain.gain.exponentialRampToValueAtTime(0.001, t + attack + mode.decay);
+                
+                osc.connect(gain);
+                gain.connect(audioCtx.destination); // Always monitor in headset
+                
+                if (recordMetronome && isRecording) {
+                    gain.connect(streamNodes.mix);
+                    if (splitExportMode && streamNodes.metronome) gain.connect(streamNodes.metronome);
+                    
+                    sessionTelemetry.push({
+                        timestamp_ms: parseFloat((performance.now() - recordingStartTime).toFixed(2)),
+                        event_action: 'hit', joint_name: 'SystemClock', joint_raw_key: 'N/A',
+                        instrument_type: 'metronome', instrument_note: isDownbeat ? 'Downbeat' : 'Beat',
+                        velocity_ms: 5.0, distance_from_center: "N/A", dsp_frequency_hz: isDownbeat ? mode.freq1 : mode.freq2, dsp_volume_gain: 0.5
+                    });
+                    
+                    setTimeout(() => {
+                        if (!isRecording) return;
+                        sessionTelemetry.push({
+                            timestamp_ms: parseFloat((performance.now() - recordingStartTime).toFixed(2)),
+                            event_action: 'release', joint_name: 'SystemClock', joint_raw_key: 'N/A',
+                            instrument_type: 'metronome', instrument_note: isDownbeat ? 'Downbeat' : 'Beat',
+                            velocity_ms: 0, distance_from_center: "N/A", dsp_frequency_hz: 0, dsp_volume_gain: 0
+                        });
+                    }, mode.decay * 1000);
+                }
+                
+                osc.start(t);
+                osc.stop(t + attack + mode.decay + 0.05);
+            };
+
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+        }
+
+        // --- VOCAL MICROPHONE LOGIC ---
+        async function toggleMicrophone() {
+            if (!audioCtx) return;
+
+            if (!micStream) {
+                try {
+                    micStream = await navigator.mediaDevices.getUserMedia({ 
+                        audio: { echoCancellation: false, autoGainControl: false, noiseSuppression: false } 
+                    });
+                    
+                    micSourceNode = audioCtx.createMediaStreamSource(micStream);
+                    micGainNode = audioCtx.createGain();
+                    
+                    micSourceNode.connect(micGainNode);
+                    micGainNode.connect(streamNodes.mix);
+                    if (splitExportMode && streamNodes.vocals) micGainNode.connect(streamNodes.vocals);
+                    if (looperDest) micGainNode.connect(looperDest); // Route Mic to Looper
+                    
+                    logSystem("MIC ACCESS GRANTED");
+                } catch (err) {
+                    logSystem("MIC ACCESS DENIED");
+                    return;
+                }
+            }
+
+            isMicActive = !isMicActive;
+            micGainNode.gain.setValueAtTime(isMicActive ? 1.0 : 0.0, audioCtx.currentTime);
+
+            if (isMicActive) {
+                logHit("Vocalist", "[MIC]", "microphone", "vocals", 5.0, { edge: "N/A", freq: 0, vol: 1.0 }, 'hit');
+            } else {
+                logHit("Vocalist", "[MIC]", "microphone", "vocals", 0, { edge: "N/A", freq: 0, vol: 0 }, 'release');
+            }
+
+            updateTransportVisuals();
+            playMenuBlip();
+        }
+
+        // --- INSTRUMENT DSP ---
+        function playDrumHit(drumType, velocity, distanceFromCenterRatio, fingerName) {
+            if (!audioCtx) return { freq: 0, vol: 0, edge: 0, decay: 0 };
+            const t = audioCtx.currentTime;
+            const kit = DRUM_KITS[currentKitIndex];
+            const boundedVel = Math.min(Math.max(velocity, 0.1), 5.0);
+            let volumeMap = (boundedVel / 5.0) * 1.5; 
+            const edgeFactor = Math.min(distanceFromCenterRatio, 1.0);
+            const isFlesh = (fingerName === 'Heel' || fingerName === 'Palm');
+            const decayTime = isFlesh ? kit.decayFlesh : kit.decayTip; 
+
+            const mainGain = audioCtx.createGain();
+            
+            if (isFlesh) volumeMap *= 1.2; 
+            mainGain.gain.setValueAtTime(volumeMap, t);
+            
+            mainGain.connect(compressor);
+            if (streamNodes.mix) mainGain.connect(streamNodes.mix);
+
+            if (looperDest) mainGain.connect(looperDest);
+            if (splitExportMode && streamNodes.drums) mainGain.connect(streamNodes.drums);
+
+            const osc = audioCtx.createOscillator();
+            const oscGain = audioCtx.createGain();
+            osc.connect(oscGain);
+            oscGain.connect(mainGain);
+
+            let baseFreq = drumType === 'macho' ? kit.freqMacho : kit.freqHembra;
+            if (isFlesh) baseFreq *= kit.fleshOctaveDrop;
+            else baseFreq += (edgeFactor * kit.edgePitchShift); 
+
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(baseFreq * kit.pitchBend, t);
+            osc.frequency.exponentialRampToValueAtTime(baseFreq, t + 0.05);
+            
+            const peakVol = 1.0 - (edgeFactor * 0.4);
+            oscGain.gain.setValueAtTime(0, t); 
+            oscGain.gain.linearRampToValueAtTime(peakVol, t + 0.005); 
+            oscGain.gain.exponentialRampToValueAtTime(0.001, t + decayTime - 0.02); 
+            oscGain.gain.linearRampToValueAtTime(0, t + decayTime); 
+
+            osc.start(t);
+            osc.stop(t + decayTime);
+
+            return { freq: baseFreq.toFixed(0), vol: volumeMap.toFixed(2), edge: edgeFactor.toFixed(2), decay: decayTime };
+        }
+
+        function playKeyHit(noteFreq, velocity) {
+            if (!audioCtx) return { freq: 0, vol: 0, edge: "N/A", decay: 0 };
+            const t = audioCtx.currentTime;
+            
+            const boundedVel = Math.min(Math.max(velocity, 0.1), 5.0);
+            const volumeMap = (boundedVel / 5.0) * 1.2; 
+
+            const mainGain = audioCtx.createGain();
+            mainGain.gain.setValueAtTime(volumeMap, t);
+
+            mainGain.connect(compressor);
+            if (streamNodes.mix) mainGain.connect(streamNodes.mix);
+
+            if (looperDest) mainGain.connect(looperDest);
+            if (splitExportMode && streamNodes.keys) mainGain.connect(streamNodes.keys);
+
+            const mode = KEY_MODES[currentKeyModeIndex];
+            const osc1 = audioCtx.createOscillator(); osc1.type = mode.type1; osc1.frequency.setValueAtTime(noteFreq, t);
+            const osc2 = audioCtx.createOscillator(); osc2.type = mode.type2; osc2.frequency.setValueAtTime(noteFreq, t);
+
+            const env = audioCtx.createGain();
+            env.gain.setValueAtTime(0, t);
+            env.gain.linearRampToValueAtTime(1.0, t + 0.015); 
+            
+            if (useKeySustain) {
+                env.gain.exponentialRampToValueAtTime(0.5, t + 0.2); 
+            } else {
+                env.gain.exponentialRampToValueAtTime(0.001, t + 1.2); 
+                osc1.stop(t + 1.2); osc2.stop(t + 1.2);
+            }
+
+            const filter = audioCtx.createBiquadFilter();
+            filter.type = 'lowpass';
+            filter.frequency.setValueAtTime(800 + (volumeMap * 3000), t);
+
+            osc1.connect(env); osc2.connect(env);
+            env.connect(filter); filter.connect(mainGain);
+
+            osc1.start(t); osc2.start(t);
+
+            let releaseFn = null;
+            if (useKeySustain) {
+                releaseFn = () => {
+                    if (!audioCtx) return;
+                    const rT = audioCtx.currentTime;
+                    env.gain.cancelScheduledValues(rT);
+                    env.gain.setValueAtTime(env.gain.value, rT);
+                    env.gain.exponentialRampToValueAtTime(0.001, rT + 0.15); 
+                    osc1.stop(rT + 0.2); osc2.stop(rT + 0.2);
+                };
+            }
+
+            return { freq: noteFreq.toFixed(0), vol: volumeMap.toFixed(2), edge: "N/A", releaseFn: releaseFn, decay: useKeySustain ? null : 1.2 };
+        }
+
+        function playPadHit(padName, velocity) {
+            if (!audioCtx) return { freq: 0, vol: 0, edge: "N/A", decay: 0 };
+            const padDef = PAD_DEFS.find(p => p.name === padName);
+            if (!padDef) return;
+
+            const t = audioCtx.currentTime;
+            const boundedVel = Math.min(Math.max(velocity, 0.1), 5.0);
+            const volumeMap = (boundedVel / 5.0) * 1.2;
+
+            const mainGain = audioCtx.createGain();
+            mainGain.gain.setValueAtTime(0, t);
+            mainGain.gain.linearRampToValueAtTime(volumeMap, t + 0.015);
+
+            let releaseFn = null;
+
+            switch(padDef.sound) {
+                case 'kick':
+                case 'impact':
+                    const oscK = audioCtx.createOscillator();
+                    oscK.type = 'sine'; oscK.frequency.setValueAtTime(padDef.freq * 4, t);
+                    oscK.frequency.exponentialRampToValueAtTime(0.01, t + 0.5);
+                    oscK.connect(mainGain); oscK.start(t); oscK.stop(t + 1.0);
+                    mainGain.gain.exponentialRampToValueAtTime(0.001, t + 1.0);
+                    break;
+                case 'zap':
+                    const oscZ = audioCtx.createOscillator();
+                    oscZ.type = 'square'; oscZ.frequency.setValueAtTime(padDef.freq, t);
+                    oscZ.frequency.exponentialRampToValueAtTime(10, t + 0.2);
+                    oscZ.connect(mainGain); oscZ.start(t); oscZ.stop(t + 0.3);
+                    mainGain.gain.exponentialRampToValueAtTime(0.001, t + 0.25);
+                    break;
+                case 'riser':
+                    const oscR = audioCtx.createOscillator();
+                    oscR.type = 'sawtooth'; oscR.frequency.setValueAtTime(padDef.freq, t);
+                    oscR.frequency.exponentialRampToValueAtTime(padDef.freq * 8, t + 2.0);
+                    oscR.connect(mainGain); oscR.start(t); oscR.stop(t + 2.1);
+                    mainGain.gain.exponentialRampToValueAtTime(0.001, t + 2.0);
+                    break;
+                case 'snare':
+                case 'hihat':
+                case 'glitch':
+                    const noiseSrc = audioCtx.createBufferSource();
+                    noiseSrc.buffer = noiseBuffer;
+                    const bp = audioCtx.createBiquadFilter();
+                    bp.type = padDef.sound === 'hihat' ? 'highpass' : 'bandpass';
+                    bp.frequency.setValueAtTime(padDef.freq, t);
+                    noiseSrc.connect(bp); bp.connect(mainGain);
+                    noiseSrc.start(t); noiseSrc.stop(t + 0.2);
+                    mainGain.gain.exponentialRampToValueAtTime(0.001, t + 0.15);
+                    break;
+                case 'drone':
+                case 'fm':
+                case 'chord':
+                    const oscS1 = audioCtx.createOscillator();
+                    const oscS2 = audioCtx.createOscillator();
+                    oscS1.type = padDef.sound === 'chord' ? 'sawtooth' : 'sine';
+                    oscS2.type = padDef.sound === 'drone' ? 'sawtooth' : 'sine';
+                    oscS1.frequency.setValueAtTime(padDef.freq, t);
+                    oscS2.frequency.setValueAtTime(padDef.sound === 'chord' ? padDef.freq * 1.25 : padDef.freq * 1.01, t);
+                    
+                    oscS1.connect(mainGain); oscS2.connect(mainGain);
+                    oscS1.start(t); oscS2.start(t);
+                    
+                    releaseFn = () => {
+                        if (!audioCtx) return;
+                        const rT = audioCtx.currentTime;
+                        mainGain.gain.cancelScheduledValues(rT);
+                        mainGain.gain.setValueAtTime(mainGain.gain.value, rT);
+                        mainGain.gain.exponentialRampToValueAtTime(0.001, rT + 0.5); 
+                        oscS1.stop(rT + 0.6); oscS2.stop(rT + 0.6);
+                    };
+                    break;
+            }
+
+            mainGain.connect(compressor);
+            if (streamNodes.mix) mainGain.connect(streamNodes.mix);
+
+            if (looperDest) mainGain.connect(looperDest);
+            if (splitExportMode && streamNodes.pads) mainGain.connect(streamNodes.pads);
+
+            return { freq: padDef.freq, vol: volumeMap.toFixed(2), edge: "N/A", releaseFn: releaseFn, decay: useKeySustain ? null : 0.5 };
+        }
+
+        function playShakerHit(velocity) {
+            if (!audioCtx) return { freq: "noise", vol: 0, edge: "N/A", decay: 0 };
+            const t = audioCtx.currentTime;
+            const mode = SHAKER_MODES[currentShakerModeIndex];
+            
+            const boundedVel = Math.min(Math.max(velocity, 0.5), 8.0);
+            const volumeMap = (boundedVel / 8.0) * 1.5;
+            
+            const noiseSrc = audioCtx.createBufferSource();
+            noiseSrc.buffer = noiseBuffer;
+            
+            const bandpass = audioCtx.createBiquadFilter();
+            bandpass.type = "bandpass";
+            bandpass.frequency.setValueAtTime(mode.baseFreq + (boundedVel * mode.freqMultiplier), t);
+            bandpass.Q.setValueAtTime(mode.q, t);
+            
+            const gainNode = audioCtx.createGain();
+            gainNode.gain.setValueAtTime(0, t);
+            gainNode.gain.linearRampToValueAtTime(volumeMap, t + 0.01); 
+            gainNode.gain.exponentialRampToValueAtTime(0.001, t + mode.decay);  
+            
+            noiseSrc.connect(bandpass);
+            bandpass.connect(gainNode);
+            
+            gainNode.connect(compressor);
+            if (streamNodes.mix) gainNode.connect(streamNodes.mix);
+
+            if (looperDest) gainNode.connect(looperDest);
+            if (splitExportMode && streamNodes.shaker) gainNode.connect(streamNodes.shaker);
+            
+            noiseSrc.start(t);
+            noiseSrc.stop(t + mode.decay + 0.05); 
+            
+            return { freq: bandpass.frequency.value.toFixed(0), vol: volumeMap.toFixed(2), edge: "N/A", decay: mode.decay };
+        }
+
+        function playHarpPluck(freq, velocity) {
+            if (!audioCtx) return { freq: 0, vol: 0, edge: "N/A", decay: 0 };
+            const t = audioCtx.currentTime;
+            const boundedVel = Math.min(Math.max(velocity, 0.1), 5.0);
+            const volumeMap = (boundedVel / 5.0) * 1.0;
+
+            const mainGain = audioCtx.createGain();
+            mainGain.gain.setValueAtTime(volumeMap, t);
+            
+            mainGain.connect(compressor);
+            if (streamNodes.mix) mainGain.connect(streamNodes.mix);
+
+            if (looperDest) mainGain.connect(looperDest);
+            if (splitExportMode && streamNodes.harp) mainGain.connect(streamNodes.harp);
+
+            const mode = HARP_MODES[currentHarpModeIndex];
+            const osc = audioCtx.createOscillator(); osc.type = mode.osc1; osc.frequency.setValueAtTime(freq, t);
+            const osc2 = audioCtx.createOscillator(); osc2.type = mode.osc2; osc2.frequency.setValueAtTime(freq, t);
+
+            const env = audioCtx.createGain();
+            env.gain.setValueAtTime(0, t);
+            env.gain.linearRampToValueAtTime(1.0, t + 0.005);
+            env.gain.exponentialRampToValueAtTime(0.001, t + mode.decay); 
+
+            const filter = audioCtx.createBiquadFilter();
+            filter.type = 'lowpass';
+            filter.frequency.setValueAtTime(Math.min(freq * mode.filterMult, 12000), t);
+            filter.frequency.exponentialRampToValueAtTime(freq, t + 0.5);
+
+            osc.connect(env); osc2.connect(env);
+            env.connect(filter); filter.connect(mainGain);
+
+            osc.start(t); osc2.start(t);
+            osc.stop(t + mode.decay); osc2.stop(t + mode.decay);
+
+            return { freq: freq.toFixed(0), vol: volumeMap.toFixed(2), edge: "N/A", decay: mode.decay };
+        }
+
+        function playMenuBlip() {
+            if (!audioCtx) return;
+            const t = audioCtx.currentTime;
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.type = 'sine'; osc.frequency.setValueAtTime(1200, t);
+            gain.gain.setValueAtTime(0.2, t);
+            gain.gain.exponentialRampToValueAtTime(0.001, t + 0.1);
+            osc.connect(gain);
+            gain.connect(audioCtx.destination); // Bypass recording buses
+            osc.start(t); osc.stop(t + 0.1);
+        }
+
+        // ==========================================
+        // 2. VIRTUAL INSTRUMENT BUILDERS
+        // ==========================================
+        function setupBongos() {
+            const bongoY = 0.25; const bongoZ = -0.4;
+            createDrum('macho', 0.09, new THREE.Vector3(-0.11, bongoY, bongoZ), 0xdd9955);
+            createDrum('hembra', 0.11, new THREE.Vector3(0.12, bongoY, bongoZ), 0xbb7733);
+        }
+
+        function createDrum(name, radius, position, color) {
+            const group = new THREE.Group();
+            group.position.copy(position);
+
+            const shellGeo = new THREE.CylinderGeometry(radius, radius * 0.8, 0.15, 32);
+            shellGeo.translate(0, -0.075, 0); 
+            const shellMat = new THREE.MeshStandardMaterial({ color: color, roughness: 0.7 });
+            const shell = new THREE.Mesh(shellGeo, shellMat);
+            group.add(shell);
+
+            const headGeo = new THREE.CircleGeometry(radius, 32);
+            headGeo.rotateX(-Math.PI / 2);
+            const headMat = new THREE.MeshStandardMaterial({ color: 0xffeedd, roughness: 0.9 });
+            const head = new THREE.Mesh(headGeo, headMat);
+            head.position.y = 0.001; 
+            group.add(head);
+
+            worldGroup.add(group);
+
+            bongos.push({
+                name: name, radius: radius, baseCenter: position.clone(), baseY: position.y,
+                mesh: head, shellMesh: shell, baseHeadColor: 0xffeedd
+            });
+        }
+
+        function setupKeyboard() {
+            const keyBaseX = 0.28; const keyBaseZ = -0.4; const bongoY = 0.25; 
+            const whiteKeyW = 0.024; const whiteKeyL = 0.14; const whiteKeyH = 0.02;
+            const blackKeyW = 0.014; const blackKeyL = 0.09; const blackKeyH = 0.015; 
+            const notes = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+            let whiteIndex = 0;
+            
+            for(let octave = 2; octave <= 5; octave++) {
+                for(let i = 0; i < 12; i++) {
+                    const noteName = notes[i] + octave;
+                    const isBlack = noteName.includes('#');
+                    const freq = 440 * Math.pow(2, ((octave * 12 + i) - 57) / 12); 
+
+                    if(!isBlack) {
+                        const posX = keyBaseX + (whiteIndex * whiteKeyW);
+                        createKey(noteName, freq, false, posX, bongoY, keyBaseZ, whiteKeyW, whiteKeyL, whiteKeyH);
+                        whiteIndex++;
+                    } else {
+                        const posX = keyBaseX + (whiteIndex * whiteKeyW) - (whiteKeyW / 2);
+                        createKey(noteName, freq, true, posX, bongoY + (whiteKeyH/2) + (blackKeyH/2), keyBaseZ - (whiteKeyL - blackKeyL)/2, blackKeyW, blackKeyL, blackKeyH);
+                    }
+                }
+            }
+            createKey('C6', 1046.50, false, keyBaseX + (whiteIndex * whiteKeyW), bongoY, keyBaseZ, whiteKeyW, whiteKeyL, whiteKeyH);
+            pianoKeys.sort((a, b) => (a.isBlack === b.isBlack) ? 0 : a.isBlack ? -1 : 1);
+        }
+
+        function createKey(noteName, freq, isBlack, posX, posY, posZ, width, length, height) {
+            const visualWidth = isBlack ? width : width - 0.0015;
+            const geo = new THREE.BoxGeometry(visualWidth, height, length);
+            const baseColor = isBlack ? 0x222222 : 0xffffff;
+            const mat = new THREE.MeshStandardMaterial({ color: baseColor, roughness: 0.5 });
+            const mesh = new THREE.Mesh(geo, mat);
+            
+            mesh.position.set(posX, posY - (height/2), posZ); 
+            worldGroup.add(mesh);
+
+            pianoKeys.push({
+                note: noteName, freq: freq, isBlack: isBlack, baseCenter: mesh.position.clone(),
+                baseY: posY, baseMeshY: mesh.position.y, width: width, length: length, mesh: mesh, baseColor: baseColor
+            });
+        }
+
+        function setupPads() {
+            const padBaseX = 0.30;
+            const padBaseZ = -0.05;
+            const padY = 0.20;
+            const padSize = 0.045;
+            const spacing = 0.055;
+
+            for (let i = 0; i < 16; i++) {
+                const row = Math.floor(i / 4);
+                const col = i % 4;
+                
+                const posX = padBaseX + (col * spacing);
+                const posZ = padBaseZ - (row * spacing); 
+                
+                const def = PAD_DEFS[i];
+                const geo = new THREE.BoxGeometry(padSize, 0.015, padSize);
+                const mat = new THREE.MeshStandardMaterial({ color: def.color, roughness: 0.8 });
+                const mesh = new THREE.Mesh(geo, mat);
+                
+                mesh.position.set(posX, padY, posZ);
+                worldGroup.add(mesh);
+                
+                samplerPads.push({
+                    name: def.name,
+                    baseCenter: mesh.position.clone(),
+                    baseY: padY + 0.0075, // Top surface
+                    baseMeshY: mesh.position.y,
+                    width: padSize, length: padSize,
+                    mesh: mesh,
+                    baseColor: def.color, activeColor: def.active
+                });
+            }
+        }
+
+        function setupShaker() {
+            const geo = new THREE.SphereGeometry(0.04, 32, 32);
+            geo.scale(1, 1.4, 1);
+            const mat = new THREE.MeshStandardMaterial({ color: 0xff3333, roughness: 0.3 });
+            shakerMesh = new THREE.Mesh(geo, mat);
+            shakerMesh.position.copy(shakerBasePos);
+            shakerMesh.userData = { isHeld: false, baseColor: 0xff3333 };
+            worldGroup.add(shakerMesh);
+
+            const standGeo = new THREE.CylinderGeometry(0.02, 0.03, 0.05, 16);
+            const standMat = new THREE.MeshStandardMaterial({ color: 0x444444 });
+            const stand = new THREE.Mesh(standGeo, standMat);
+            stand.position.copy(shakerBasePos); stand.position.y -= 0.05;
+            worldGroup.add(stand);
+        }
+
+        function setupHarp() {
+            const harpBaseX = -0.55; const harpBaseZ = -0.2; 
+            const zSpacing = -0.025; const bottomY = 0.1;
+            
+            const notes = [
+                {n:'C4', f:261.63, c:0xff3333}, {n:'D4', f:293.66, c:0xeeeeee}, {n:'E4', f:329.63, c:0xeeeeee},
+                {n:'F4', f:349.23, c:0x3333ff}, {n:'G4', f:392.00, c:0xeeeeee}, {n:'A4', f:440.00, c:0xeeeeee}, {n:'B4', f:493.88, c:0xeeeeee},
+                {n:'C5', f:523.25, c:0xff3333}, {n:'D5', f:587.33, c:0xeeeeee}, {n:'E5', f:659.25, c:0xeeeeee},
+                {n:'F5', f:698.46, c:0x3333ff}, {n:'G5', f:783.99, c:0xeeeeee}, {n:'A5', f:880.00, c:0xeeeeee}, {n:'B5', f:987.77, c:0xeeeeee},
+                {n:'C6', f:1046.50, c:0xff3333}
+            ];
+
+            notes.forEach((note, i) => {
+                const zPos = harpBaseZ + (i * zSpacing);
+                const stringLength = 0.4 - (i * 0.015);
+                const topY = bottomY + stringLength;
+                const midY = bottomY + (stringLength / 2);
+
+                const geo = new THREE.CylinderGeometry(0.002, 0.002, stringLength, 8);
+                const mat = new THREE.MeshStandardMaterial({ color: note.c, roughness: 0.2, metalness: 0.8 });
+                const mesh = new THREE.Mesh(geo, mat);
+                mesh.position.set(harpBaseX, midY, zPos);
+                worldGroup.add(mesh);
+
+                harpStrings.push({
+                    note: note.n, freq: note.f, baseColor: note.c, mesh: mesh,
+                    x: harpBaseX, z: zPos, bottomY: bottomY, topY: topY
+                });
+            });
+
+            const bottomMesh = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.02, 0.4), new THREE.MeshStandardMaterial({color: 0x8b4513}));
+            bottomMesh.position.set(harpBaseX, bottomY, harpBaseZ - 0.175);
+            worldGroup.add(bottomMesh);
+        }
+
+        // ==========================================
+        // 3. UI MENUS & HUD
+        // ==========================================
+        function setupMenus() {
+            menuGroup = new THREE.Group();
+            menuGroup.position.set(0, 0.40, -0.55); 
+            menuGroup.rotation.x = Math.PI / 6; 
+            worldGroup.add(menuGroup);
+
+            // Expanded Backing Panel
+            const panelMesh = new THREE.Mesh(
+                new THREE.BoxGeometry(1.4, 0.35, 0.01),
+                new THREE.MeshStandardMaterial({ color: 0x151515, roughness: 0.9 })
+            );
+            panelMesh.position.set(0, 0, -0.01);
+            menuGroup.add(panelMesh);
+
+            // ROW 1: Instruments (Y = 0.10)
+            let xOff = -0.55; 
+            HARP_MODES.forEach((m, i) => { createVRButton(xOff, 0.10, 0, 'harp_mode', i, m.name); xOff += 0.08; }); xOff += 0.04;
+            SHAKER_MODES.forEach((m, i) => { createVRButton(xOff, 0.10, 0, 'shaker_mode', i, m.name); xOff += 0.08; }); xOff += 0.04;
+            DRUM_KITS.forEach((m, i) => { createVRButton(xOff, 0.10, 0, 'drum_kit', i, m.name); xOff += 0.08; }); xOff += 0.04;
+            KEY_MODES.forEach((m, i) => { createVRButton(xOff, 0.10, 0, 'key_mode', i, m.name); xOff += 0.08; });
+
+            // ROW 2: Metro/Config (Y = 0.02)
+            createMetroUIButton(-0.25, 0.02, 0, 'BPM_DOWN', 'MET BPM-');
+            createMetroUIButton(-0.15, 0.02, 0, 'BPM_UP', 'MET BPM+');
+            createMetroUIButton(-0.05, 0.02, 0, 'EMPHASIS', 'MET EMPH');
+            createMetroUIButton(0.05, 0.02, 0, 'TIMBRE', 'MET TMBR');
+            createMetroUIButton(0.15, 0.02, 0, 'REC_METRO', 'REC MET');
+            createMetroUIButton(0.25, 0.02, 0, 'VID_REC', 'REC VID'); 
+            createMetroUIButton(0.35, 0.02, 0, 'RESET_WS', '[RESET]');
+
+            // ROW 3: Transport (Y = -0.06)
+            createTransportButton(-0.20, -0.06, 0, 'REC', 'REC', 0xff0000);
+            createTransportButton(-0.10, -0.06, 0, 'STOP', 'STOP', 0xffffff);
+            createTransportButton(0.00, -0.06, 0, 'PLAY', 'PLAY', 0x00ffcc);
+            createTransportButton(0.10, -0.06, 0, 'METRO', 'MET', 0xffaa00);
+            createTransportButton(0.20, -0.06, 0, 'MIC', 'MIC', 0xaa00ff); 
+
+            // ROW 4: Loopers (Y = -0.14)
+            for (let i = 0; i < NUM_LOOPERS; i++) {
+                createLooperButton(-0.15 + (i * 0.1), -0.14, 0, i, `LOOP ${i+1}`);
+            }
+
+            // Cache Collision Centers for ALL menus
+            const cacheCenters = (arr) => {
+                arr.forEach(btn => {
+                    const localPos = btn.localCenter.clone();
+                    localPos.applyEuler(menuGroup.rotation);
+                    localPos.add(menuGroup.position);
+                    btn.worldOffset = localPos;
+                });
+            };
+            
+            cacheCenters(vrButtons);
+            cacheCenters(transportButtons);
+            cacheCenters(metroUIButtons);
+            cacheCenters(looperUIButtons);
+
+            updateMenuVisuals(); 
+            updateTransportVisuals();
+            updateMetroUIVisuals();
+            updateLooperVisuals();
+        }
+
+        // --- CRISP 3D TEXT GENERATOR ---
+        function createButtonLabel(text, w, h) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 256; 
+            canvas.height = 128;
+            const ctx = canvas.getContext('2d');
+            
+            // Transparent background
+            ctx.clearRect(0, 0, 256, 128); 
+            
+            // Dynamically scale font based on word length so "CLASSICAL" fits just as well as "REC"
+            const fontSize = text.length > 6 ? 28 : 36;
+            ctx.font = `bold ${fontSize}px "Segoe UI", sans-serif`;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            
+            // Draw heavy black outline for contrast on bright buttons
+            ctx.lineWidth = 6;
+            ctx.strokeStyle = '#000000';
+            ctx.strokeText(text, 128, 64);
+            
+            // Draw crisp white text
+            ctx.fillStyle = '#ffffff';
+            ctx.fillText(text, 128, 64);
+            
+            const texture = new THREE.CanvasTexture(canvas);
+            const mat = new THREE.MeshBasicMaterial({ map: texture, transparent: true, depthWrite: false });
+            return new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
+        }
+
+        // Button Helpers
+        function createVRButton(posX, posY, posZ, type, index, label) {
+            const width = 0.07; const length = 0.04; const height = 0.015;
+            const group = new THREE.Group(); group.position.set(posX, posY, posZ);
+            const capMesh = new THREE.Mesh(new THREE.BoxGeometry(width, length, height), new THREE.MeshStandardMaterial({ color: 0x444444, emissive: 0x000000 }));
+            capMesh.position.z = height / 2; group.add(capMesh); 
+            const textMesh = createButtonLabel(label, width, length);
+            textMesh.position.z = height + 0.001; group.add(textMesh);
+            menuGroup.add(group);
+            vrButtons.push({ type: type, index: index, label: label, mesh: capMesh, localCenter: group.position.clone(), activationRadius: 0.035 });
+        }
+        
+        function createTransportButton(posX, posY, posZ, action, label, baseColor) {
+            const width = 0.07; const length = 0.04; const height = 0.02;
+            const group = new THREE.Group(); group.position.set(posX, posY, posZ);
+            const capMesh = new THREE.Mesh(new THREE.BoxGeometry(width, length, height), new THREE.MeshStandardMaterial({ color: baseColor, emissive: 0x000000 }));
+            capMesh.position.z = height / 2; group.add(capMesh); 
+            const textMesh = createButtonLabel(label, width, length);
+            textMesh.position.z = height + 0.001; group.add(textMesh);
+            menuGroup.add(group);
+            transportButtons.push({ action: action, baseColor: baseColor, mesh: capMesh, localCenter: group.position.clone(), activationRadius: 0.04 });
+        }
+        
+        function createMetroUIButton(posX, posY, posZ, action, label) {
+            const width = 0.07; const length = 0.04; const height = 0.02;
+            const group = new THREE.Group(); group.position.set(posX, posY, posZ);
+            const capMesh = new THREE.Mesh(new THREE.BoxGeometry(width, length, height), new THREE.MeshStandardMaterial({ color: 0x2255aa, emissive: 0x000000 }));
+            capMesh.position.z = height / 2; group.add(capMesh); 
+            const textMesh = createButtonLabel(label, width, length);
+            textMesh.position.z = height + 0.001; group.add(textMesh);
+            menuGroup.add(group);
+            metroUIButtons.push({ action: action, label: label, mesh: capMesh, localCenter: group.position.clone(), activationRadius: 0.04 });
+        }
+        
+        function createLooperButton(posX, posY, posZ, index, label) {
+            const width = 0.08; const length = 0.05; const height = 0.02;
+            const group = new THREE.Group(); group.position.set(posX, posY, posZ);
+            const capMesh = new THREE.Mesh(new THREE.BoxGeometry(width, length, height), new THREE.MeshStandardMaterial({ color: 0x333333, emissive: 0x000000 }));
+            capMesh.position.z = height / 2; group.add(capMesh); 
+            const textMesh = createButtonLabel(label, width, length);
+            textMesh.position.z = height + 0.001; group.add(textMesh);
+            menuGroup.add(group);
+            looperUIButtons.push({ index: index, label: label, mesh: capMesh, localCenter: group.position.clone(), activationRadius: 0.04 });
+        }
+
+        // Update Helpers
+        function updateMenuVisuals() {
+            vrButtons.forEach(btn => {
+                const isActive = (btn.type === 'drum_kit' && btn.index === currentKitIndex) || (btn.type === 'key_mode' && btn.index === currentKeyModeIndex) || (btn.type === 'harp_mode' && btn.index === currentHarpModeIndex) || (btn.type === 'shaker_mode' && btn.index === currentShakerModeIndex);
+                if (isActive) { btn.mesh.material.color.setHex(0x00ffcc); btn.mesh.material.emissive.setHex(0x005544); }
+                else { btn.mesh.material.color.setHex(0x444444); btn.mesh.material.emissive.setHex(0x000000); }
+            });
+        }
+        function updateTransportVisuals() {
+            transportButtons.forEach(btn => {
+                if (btn.action === 'REC') btn.mesh.material.emissive.setHex(isRecording ? 0x660000 : 0x000000);
+                else if (btn.action === 'PLAY') btn.mesh.material.emissive.setHex(isPlayingBack ? 0x006644 : 0x000000);
+                else if (btn.action === 'METRO') btn.mesh.material.emissive.setHex(isMetronomeOn ? 0x664400 : 0x000000); 
+                else if (btn.action === 'MIC') btn.mesh.material.emissive.setHex(isMicActive ? 0x5500aa : 0x000000); 
+            });
+        }
+        function updateMetroUIVisuals() {
+            metroUIButtons.forEach(btn => {
+                if (btn.action === 'EMPHASIS') btn.mesh.material.emissive.setHex(metronomeEmphasis ? 0x0055ff : 0x000000);
+                else if (btn.action === 'REC_METRO') btn.mesh.material.emissive.setHex(recordMetronome ? 0xff0000 : 0x000000); 
+                else if (btn.action === 'VID_REC') btn.mesh.material.emissive.setHex(mrRecorder && mrRecorder.state === 'recording' ? 0xff0000 : 0x000000);
+                else if (btn.action === 'RESET_WS') btn.mesh.material.color.setHex(0xaa1111);
+                else btn.mesh.material.color.setHex(0x2255aa); 
+            });
+        }
+        function updateLooperVisuals() {
+            looperUIButtons.forEach(btn => {
+                const loop = loopers[btn.index];
+                if (loop.state === 'EMPTY') { btn.mesh.material.emissive.setHex(0x000000); btn.mesh.material.color.setHex(0x333333); }
+                else if (loop.state === 'REC') { btn.mesh.material.emissive.setHex(0xff0000); btn.mesh.material.color.setHex(0xff5555); }
+                else if (loop.state === 'PROCESSING') { btn.mesh.material.emissive.setHex(0xffaa00); }
+                else if (loop.state === 'PLAY') { btn.mesh.material.emissive.setHex(0x00ff00); btn.mesh.material.color.setHex(0x55ff55); }
+                else if (loop.state === 'STOPPED') { btn.mesh.material.emissive.setHex(0x000000); btn.mesh.material.color.setHex(0xaaaa22); }
+            });
+        }
+
+        // --- HUD ---
+        function setupHUD() {
+            hudCanvas = document.createElement('canvas'); hudCanvas.width = 1536; hudCanvas.height = 512;
+            hudContext = hudCanvas.getContext('2d');
+            hudTexture = new THREE.CanvasTexture(hudCanvas);
+            hudMesh = new THREE.Mesh(new THREE.PlaneGeometry(1.2, 0.4), new THREE.MeshBasicMaterial({ map: hudTexture, transparent: true, opacity: 0.9 }));
+            hudMesh.position.set(0, 0.85, -0.6); 
+            worldGroup.add(hudMesh);
+            updateHUD();
+        }
+
+        function logSystem(msgText) {
+            const time = new Date().toTimeString().split(' ')[0];
+            hitLogs.unshift(`[${time}] SYSTEM: ${msgText}`);
+            if (hitLogs.length > 7) hitLogs.pop();
+            updateHUD();
+        }
+
+        function logHit(fingerName, rawKey, instrumentName, instrumentType, velocity, telemetry, eventAction = 'hit') {
+            const now = new Date(); const time = now.toTimeString().split(' ')[0];
+            let displayId = (instrumentType === instrumentName) ? instrumentType.toUpperCase() : `${instrumentType.toUpperCase()} [${instrumentName.toUpperCase()}]`;
+
+            if (eventAction === 'hit') {
+                hitLogs.unshift(`[${time}] ${fingerName} [${rawKey}] hit ${displayId} | Vel: ${velocity.toFixed(2)}`);
+                if (hitLogs.length > 7) hitLogs.pop(); 
+                updateHUD();
+                animateInstrument(instrumentName, instrumentType);
+            }
+            
+            if (isRecording) {
+                sessionTelemetry.push({
+                    timestamp_ms: parseFloat((performance.now() - recordingStartTime).toFixed(2)),
+                    event_action: eventAction, joint_name: fingerName, joint_raw_key: rawKey,
+                    instrument_type: instrumentType, instrument_note: instrumentName,
+                    velocity_ms: parseFloat(velocity.toFixed(3)), distance_from_center: telemetry.edge === "N/A" ? "N/A" : parseFloat(telemetry.edge),
+                    dsp_frequency_hz: telemetry.freq === "noise" ? "noise" : parseInt(telemetry.freq), dsp_volume_gain: parseFloat(telemetry.vol)
+                });
+            }
+
+            if (activeRecLoopIndex !== -1) {
+                const relTime = parseFloat((performance.now() - loopers[activeRecLoopIndex].startTimeMs).toFixed(2));
+                loopers[activeRecLoopIndex].telemetry.push({
+                    loop_time_ms: relTime, event_action: eventAction, joint_name: fingerName, joint_raw_key: rawKey,
+                    instrument_type: instrumentType, instrument_note: instrumentName, velocity_ms: parseFloat(velocity.toFixed(3)),
+                    distance_from_center: telemetry.edge === "N/A" ? "N/A" : parseFloat(telemetry.edge),
+                    dsp_frequency_hz: telemetry.freq === "noise" ? "noise" : parseInt(telemetry.freq), dsp_volume_gain: parseFloat(telemetry.vol)
+                });
+            }
+
+            // AUTO-RELEASE DUMMY EVENTS (For MIDI length)
+            if (eventAction === 'hit' && telemetry.decay) {
+                setTimeout(() => {
+                    logHit(fingerName, rawKey, instrumentName, instrumentType, 0, telemetry, 'release');
+                }, telemetry.decay * 1000); 
+            }
+        }
+
+        function updateHUD() {
+            hudContext.clearRect(0, 0, hudCanvas.width, hudCanvas.height);
+            hudContext.fillStyle = 'rgba(10, 15, 20, 0.85)';
+            hudContext.roundRect(0, 0, hudCanvas.width, hudCanvas.height, 20); hudContext.fill();
+            hudContext.strokeStyle = '#00ffcc'; hudContext.lineWidth = 4; hudContext.stroke();
+
+            hudContext.fillStyle = '#ff0077'; hudContext.font = 'bold 32px monospace';
+            hudContext.fillText('REALTIME FINGER TELEMETRY', 20, 50);
+
+            hudContext.fillStyle = '#ffffff'; hudContext.font = '14px monospace';
+            hudContext.fillText('R-Stick: Height/Track | L-Stick: Kit/Hit | L-Btn X: Dots | R-A/B Btns: Rec/Stop / Play', 750, 35);
+
+            hudContext.fillStyle = hitMode === 'advanced' ? '#ff00ff' : '#ffff00';
+            const modeText = `DRUM:[${DRUM_KITS[currentKitIndex].name}] KEY:[${KEY_MODES[currentKeyModeIndex].name}] HARP:[${HARP_MODES[currentHarpModeIndex].name}] SHAKE:[${SHAKER_MODES[currentShakerModeIndex].name}] MIC:[${isMicActive ? 'LIVE' : 'MUTED'}]`;
+            hudContext.fillText(modeText, 750, 60);
+
+            const metroText = `METRO:[${isMetronomeOn ? 'PLAYING' : 'MUTED'}] BPM:[${bpm}] REC-CLICK:[${recordMetronome ? 'ON' : 'OFF'}] EMPH:[${metronomeEmphasis ? 'ON' : 'OFF'}] TIMBRE:[${METRO_MODES[currentMetroModeIndex].name}]`;
+            hudContext.fillText(metroText, 750, 85);
+
+            hudContext.fillStyle = '#00ffcc'; hudContext.font = '24px monospace';
+            for (let i = 0; i < hitLogs.length; i++) hudContext.fillText(hitLogs[i], 20, 120 + (i * 40));
+
+            if (isRecording) {
+                const elapsed = (performance.now() - recordingStartTime) / 1000;
+                const mins = Math.floor(elapsed / 60).toString().padStart(2, '0'); const secs = Math.floor(elapsed % 60).toString().padStart(2, '0');
+                hudContext.fillStyle = Math.floor(elapsed * 2) % 2 === 0 ? '#ff0000' : '#660000';
+                hudContext.beginPath(); hudContext.arc(1420, 60, 10, 0, Math.PI * 2); hudContext.fill();
+                hudContext.fillStyle = '#ff0000'; hudContext.font = 'bold 26px monospace';
+                hudContext.fillText(`REC ${mins}:${secs}`, 1280, 68);
+            } else if (isPlayingBack) {
+                hudContext.fillStyle = '#00ffcc'; hudContext.font = 'bold 26px monospace';
+                hudContext.fillText(`▶ PLAYING`, 1350, 68);
+            }
+            hudTexture.needsUpdate = true;
+        }
+
+        // --- VISUAL FEEDBACK HELPERS ---
+        function updateDrumVisuals() {
+            const kit = DRUM_KITS[currentKitIndex];
+            bongos.forEach(drum => {
+                if (drum.name === 'macho') drum.shellMesh.material.color.setHex(kit.colorMacho);
+                if (drum.name === 'hembra') drum.shellMesh.material.color.setHex(kit.colorHembra);
+                drum.mesh.material.color.setHex(kit.headColor);
+                drum.baseHeadColor = kit.headColor; 
+            });
+            logSystem(`Loaded Kit: ${kit.name}`);
+        }
+
+        function animateInstrument(name, type) {
+            if (type === 'shaker') {
+                shakerMesh.material.color.setHex(0xffffff); setTimeout(() => shakerMesh.material.color.setHex(shakerMesh.userData.baseColor), 100); return;
+            } else if (type === 'bongo') {
+                const drum = bongos.find(d => d.name === name);
+                if (drum && drum.mesh) { drum.mesh.material.color.setHex(0xffffff); setTimeout(() => drum.mesh.material.color.setHex(drum.baseHeadColor), 100); } return;
+            } else if (type === 'harp') {
+                const harp = harpStrings.find(s => s.note === name);
+                if (harp && harp.mesh) {
+                    harp.mesh.material.color.setHex(0xffffff); harp.mesh.scale.set(2, 1, 2);
+                    setTimeout(() => { harp.mesh.material.color.setHex(harp.baseColor); harp.mesh.scale.set(1, 1, 1); }, 100);
+                } return;
+            } else if (type === 'key') {
+                if (useKeySustain) return; 
+                const key = pianoKeys.find(k => k.note === name);
+                if (key && key.mesh) { key.mesh.material.color.setHex(0x00ffff); setTimeout(() => key.mesh.material.color.setHex(key.baseColor), 100); } return;
+            } else if (type === 'pad') {
+                if (useKeySustain) return; 
+                const pad = samplerPads.find(p => p.name === name);
+                if (pad && pad.mesh) { 
+                    pad.mesh.material.color.setHex(pad.activeColor); 
+                    setTimeout(() => pad.mesh.material.color.setHex(pad.baseColor), 100); 
+                } 
+                return;
+            }
+        }
+
+        function pressKeyVisual(name) {
+            const key = pianoKeys.find(k => k.note === name);
+            if (key && key.mesh) {
+                key.mesh.material.color.setHex(0x00ffff);
+                if (pushKeysDown) key.mesh.position.y = key.baseMeshY - 0.005; 
+            }
+        }
+        function releaseKeyVisual(name) {
+            const key = pianoKeys.find(k => k.note === name);
+            if (key && key.mesh) {
+                key.mesh.material.color.setHex(key.baseColor);
+                if (pushKeysDown) key.mesh.position.y = key.baseMeshY; 
+            }
+        }
+        function pressPadVisual(name) {
+            const pad = samplerPads.find(p => p.name === name);
+            if (pad && pad.mesh) {
+                pad.mesh.material.color.setHex(pad.activeColor); 
+                if (pushKeysDown) pad.mesh.position.y = pad.baseMeshY - 0.005; 
+            }
+        }
+        function releasePadVisual(name) {
+            const pad = samplerPads.find(p => p.name === name);
+            if (pad && pad.mesh) {
+                pad.mesh.material.color.setHex(pad.baseColor); 
+                if (pushKeysDown) pad.mesh.position.y = pad.baseMeshY; 
+            }
+        }
+
+        // ==========================================
+        // 4. RECORDING & LOOPING CONTROLLERS
+        // ==========================================
+        function toggleRecording() {
+            const tracksToRecord = splitExportMode ? ['mix', 'drums', 'keys', 'shaker', 'harp', 'vocals', 'metronome', 'looper', 'pads'] : ['mix'];
+            const dateStr = new Date().toISOString().slice(0, 19).replace(/:/g, '-');
+            const baseFileName = `VR_Studio_Session_${dateStr}`;
+
+            if (!isRecording) {
+                sessionTelemetry = []; 
+                tracksToRecord.forEach(track => {
+                    trackChunks[track] = [];
+                    recorders[track] = new MediaRecorder(streamNodes[track].stream, { mimeType: 'audio/webm' });
+                    recorders[track].ondataavailable = (e) => { if (e.data.size > 0) trackChunks[track].push(e.data); };
+                    recorders[track].onstop = () => {
+                        const blob = new Blob(trackChunks[track], { type: 'audio/webm' });
+                        const url = URL.createObjectURL(blob);
+                        if (track === 'mix') { 
+                            if (recordedAudioURL) URL.revokeObjectURL(recordedAudioURL);
+                            recordedAudioBlob = blob; 
+                            recordedAudioURL = url; 
+
+                            refreshVRViewer();
+                        }
+
+                        const aAudio = document.createElement('a'); aAudio.style.display = 'none';
+                        aAudio.href = url; aAudio.download = `${baseFileName}_${track.toUpperCase()}.webm`;
+                        document.body.appendChild(aAudio); aAudio.click();
+                        setTimeout(() => {
+                            document.body.removeChild(aAudio);
+                            if (track !== 'mix') URL.revokeObjectURL(url); 
+                        }, 100);
+                    };
+                    recorders[track].start();
+                });
+                isRecording = true; recordingStartTime = performance.now();
+                logSystem(`🔴 REC STARTED (${tracksToRecord.length} TRACKS)`);
+            } else {
+                tracksToRecord.forEach(track => { if (recorders[track] && recorders[track].state !== 'inactive') recorders[track].stop(); });
+                isRecording = false;
+
+                const saveJSON = (data, suffix) => {
+                    const jsonBlob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+                    const jsonUrl = URL.createObjectURL(jsonBlob);
+                    const aJson = document.createElement('a'); aJson.style.display = 'none';
+                    aJson.href = jsonUrl; aJson.download = `${baseFileName}_${suffix}.json`;
+                    document.body.appendChild(aJson); aJson.click();
+                    setTimeout(() => {
+                        document.body.removeChild(aJson);
+                        URL.revokeObjectURL(jsonUrl);
+                    }, 100);
+                };
+
+                if (splitExportMode) {
+                    saveJSON(sessionTelemetry.filter(t => t.instrument_type === 'bongo'), 'DRUMS');
+                    saveJSON(sessionTelemetry.filter(t => t.instrument_type === 'key'), 'KEYS');
+                    saveJSON(sessionTelemetry.filter(t => t.instrument_type === 'shaker'), 'SHAKER');
+                    saveJSON(sessionTelemetry.filter(t => t.instrument_type === 'harp'), 'HARP');
+                    saveJSON(sessionTelemetry.filter(t => t.instrument_type === 'vocals'), 'VOCALS'); 
+                    saveJSON(sessionTelemetry.filter(t => t.instrument_type === 'metronome'), 'METRO'); 
+                    saveJSON(sessionTelemetry.filter(t => t.instrument_type === 'pad'), 'PADS'); 
+                    saveJSON(sessionTelemetry.filter(t => t.is_loop_ghost), 'LOOPS'); 
+                    saveJSON(sessionTelemetry, 'MIXED'); 
+                } else {
+                    saveJSON(sessionTelemetry, 'MIXED');
+                }
+                logSystem("⏹ RECORDING STOPPED & FILES SAVED");
+                updateTransportVisuals(); updateHUD();
+            }
+        }
+
+        function togglePlayback() {
+            if (!recordedAudioURL) return logSystem("⚠️ NO RECORDING TO PLAY");
+            if (!isPlayingBack) {
+                if (!playbackAudioElement) {
+                    playbackAudioElement = new Audio();
+                    playbackSourceNode = audioCtx.createMediaElementSource(playbackAudioElement);
+                    playbackSourceNode.connect(audioCtx.destination);
+                }
+                
+                // Swap the source to the latest recording
+                playbackAudioElement.src = recordedAudioURL;
+                playbackAudioElement.onended = () => { 
+                    isPlayingBack = false; 
+                    updateTransportVisuals(); 
+                    updateHUD(); 
+                    logSystem("⏹ PLAYBACK FINISHED"); 
+                };
+                
+                playbackAudioElement.play();
+                isPlayingBack = true;
+                playbackStartTime = audioCtx.currentTime;
+                logSystem("▶ PLAYBACK STARTED");
+            } else {
+                if (playbackAudioElement) playbackAudioElement.pause();
+                isPlayingBack = false; 
+                logSystem("⏹ PLAYBACK STOPPED");
+            }
+            updateTransportVisuals(); updateHUD();
+        }
+
+        function toggleLooper(index) {
+            const loop = loopers[index];
+            if (loop.state === 'EMPTY' || loop.state === 'STOPPED') {
+                if (activeRecLoopIndex !== -1) return logSystem("⚠️ ALREADY RECORDING A LOOP");
+                if (loop.sourceNode) {
+                    try { loop.sourceNode.stop(); } catch(e){}
+                    loop.sourceNode.disconnect();
+                    loop.sourceNode = null;
+                }
+                if (loop.gainNode) { loop.gainNode.disconnect(); loop.gainNode = null; }
+                loop.audioBuffer = null;
+                loop.state = 'REC'; loop.telemetry = []; loop.startTimeMs = performance.now();
+                activeRecLoopIndex = index; looperChunks = [];
+                looperRecorder = new MediaRecorder(looperDest.stream, { mimeType: 'audio/webm' });
+                looperRecorder.ondataavailable = e => { if (e.data.size > 0) looperChunks.push(e.data); };
+                looperRecorder.onstop = async () => {
+                    const blob = new Blob(looperChunks, { type: 'audio/webm' });
+                    loop.audioBuffer = await audioCtx.decodeAudioData(await blob.arrayBuffer());
+                    loop.durationMs = loop.audioBuffer.duration * 1000;
+                    startLoopPlayback(index);
+                };
+                looperRecorder.start(); logSystem(`🔴 LOOP ${index + 1} RECORDING`);
+            } else if (loop.state === 'REC') {
+                loop.state = 'PROCESSING'; activeRecLoopIndex = -1;
+                looperRecorder.stop(); logSystem(`⚙️ LOOP ${index + 1} SAVING...`);
+            } else if (loop.state === 'PLAY') {
+                loop.state = 'STOPPED';
+                if (loop.sourceNode) { loop.sourceNode.stop(); loop.sourceNode.disconnect(); loop.sourceNode = null; }
+                logSystem(`⏹ LOOP ${index + 1} STOPPED`);
+            }
+            updateLooperVisuals();
+        }
+
+        function startLoopPlayback(index) {
+            const loop = loopers[index]; loop.state = 'PLAY'; loop.lastLoopTime = undefined; 
+            const src = audioCtx.createBufferSource(); src.buffer = loop.audioBuffer; src.loop = true;
+            const gain = audioCtx.createGain(); gain.gain.value = 0.85; 
+            src.connect(gain); gain.connect(compressor);
+            if (splitExportMode && streamNodes.looper) gain.connect(streamNodes.looper);
+            gain.connect(streamNodes.mix);
+            loop.sourceNode = src; loop.gainNode = gain; loop.playStartTime = audioCtx.currentTime;
+            src.start(); logSystem(`▶ LOOP ${index + 1} PLAYING`);
+            updateLooperVisuals();
+        }
+
+        async function toggleScreenRecord() {
+            if (mrRecorder && mrRecorder.state === 'recording') {
+                mrRecorder.stop(); updateMetroUIVisuals(); logSystem("⏹ VIDEO CAPTURE STOPPED"); return;
+            }
+            const canvasStream = renderer.domElement.captureStream(30); 
+            const audioStream = streamNodes.mix.stream;
+            const combinedStream = new MediaStream([ ...canvasStream.getVideoTracks(), ...audioStream.getAudioTracks() ]);
+            mrRecorder = new MediaRecorder(combinedStream, { mimeType: 'video/webm; codecs=vp8,opus' });
+            mrChunks = [];
+            mrRecorder.ondataavailable = (e) => { if (e.data.size > 0) mrChunks.push(e.data); };
+            mrRecorder.onstop = () => {
+                const blob = new Blob(mrChunks, { type: 'video/webm' });
+                const a = document.createElement('a'); a.style.display = 'none';
+                a.href = URL.createObjectURL(blob); a.download = `VR_Studio_Capture_${new Date().getTime()}.webm`;
+                document.body.appendChild(a); a.click();
+                setTimeout(() => {
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                }, 100);
+            };
+            mrRecorder.start(); updateMetroUIVisuals(); logSystem("🔴 VIDEO CAPTURE STARTED");
+        }
+
+        // ---
+
+        // --- UNIVERSAL WORKSPACE RESET ---
+        function resetWorkspace() {
+            logSystem("⚠️ RESETTING WORKSPACE...");
+            
+            // 1. Force stop recordings
+            if (isRecording) toggleRecording();
+            if (mrRecorder && mrRecorder.state === 'recording') toggleScreenRecord();
+            // 2. Force stop playback
+            if (isPlayingBack) togglePlayback();
+            // 3. Reset Metronome
+            if (isMetronomeOn) {
+                isMetronomeOn = false;
+                lastBeatTime = 0; beatCount = 0;
+            }
+            // 4. Wipe Master Telemetry & Master Audio Memory
+            if (recordedAudioURL) {
+                URL.revokeObjectURL(recordedAudioURL);
+                recordedAudioURL = null;
+                recordedAudioBlob = null;
+            }
+            sessionTelemetry = [];
+            // 5. Hard Reset all 4 Loopers
+            loopers.forEach((loop, i) => {
+                if (loop.sourceNode) {
+                    try { loop.sourceNode.stop(); } catch(e){}
+                    loop.sourceNode.disconnect(); loop.sourceNode = null;
+                }
+                if (loop.gainNode) { loop.gainNode.disconnect(); loop.gainNode = null; }
+                if (looperRecorder && activeRecLoopIndex === i && looperRecorder.state !== 'inactive') looperRecorder.stop();
+                
+                loop.state = 'EMPTY';
+                loop.audioBuffer = null;
+                loop.telemetry = [];
+                loop.durationMs = 0; loop.playStartTime = 0; loop.lastLoopTime = undefined;
+            });
+            activeRecLoopIndex = -1;
+            // 6. Reset the DAW Viewer Canvas to blank
+            viewerCtx.fillStyle = '#111111'; viewerCtx.fillRect(0, 0, 2048, 1024);
+            viewerCtx.fillStyle = '#444'; viewerCtx.font = '60px monospace'; viewerCtx.fillText('READY TO RECORD', 800, 500);
+            viewerTexture.needsUpdate = true;
+            if (playheadMesh) playheadMesh.visible = false;
+            // 7. Refresh all UI lights
+            updateTransportVisuals();
+            updateMetroUIVisuals();
+            updateLooperVisuals();
+            updateHUD();
+            
+            logSystem("✅ WORKSPACE CLEARED");
+            playMenuBlip();
+        }
+
+        // ==========================================
+        // 5. IN-VR DAW PIANO ROLL VIEWER
+        // ==========================================
+        function setupVRViewer() {
+            viewerGroup = new THREE.Group();
+            viewerGroup.position.set(0, 1.6, -1.4); 
+            worldGroup.add(viewerGroup);
+
+            viewerCanvas = document.createElement('canvas'); viewerCanvas.width = 2048; viewerCanvas.height = 1024;
+            viewerCtx = viewerCanvas.getContext('2d');
+            viewerCtx.fillStyle = '#111111'; viewerCtx.fillRect(0, 0, 2048, 1024);
+            viewerCtx.fillStyle = '#444'; viewerCtx.font = '60px monospace'; viewerCtx.fillText('READY TO RECORD', 800, 500);
+
+            viewerTexture = new THREE.CanvasTexture(viewerCanvas);
+            viewerMesh = new THREE.Mesh(new THREE.PlaneGeometry(VIEWER_WIDTH, 1.0), new THREE.MeshBasicMaterial({ map: viewerTexture, transparent: true }));
+            viewerGroup.add(viewerMesh);
+
+            playheadMesh = new THREE.Mesh(new THREE.BoxGeometry(0.005, 1.0, 0.005), new THREE.MeshBasicMaterial({ color: 0xff0077 }));
+            playheadMesh.position.set(-VIEWER_WIDTH / 2, 0, 0.01); playheadMesh.visible = false;
+            viewerGroup.add(playheadMesh);
+        }
+
+        async function refreshVRViewer() {
+            if (sessionTelemetry.length === 0 || !recordedAudioBlob) {
+                logSystem("⚠️ VIEWER: No telemetry or audio blob found!");
+                return;
+            }
+            try {
+                logSystem("⚙️ DECODING STEMS FOR VIEWER...");
+
+                const arrayBuffer = await recordedAudioBlob.arrayBuffer();
+                const decodedBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+                viewerDurationMs = decodedBuffer.duration * 1000;
+                
+                let parsedNotes = []; let uniqueInstruments = []; const openNotes = new Map();
+                sessionTelemetry.sort((a, b) => a.timestamp_ms - b.timestamp_ms);
+                sessionTelemetry.forEach(event => {
+                    const trackId = `${event.instrument_type}_${event.instrument_note}`;
+                    if (!uniqueInstruments.includes(trackId)) uniqueInstruments.push(trackId);
+                    if (event.event_action === 'hit') openNotes.set(trackId, { type: event.instrument_type, startTime: event.timestamp_ms, velocity: event.velocity_ms });
+                    else if (event.event_action === 'release' && openNotes.has(trackId)) {
+                        const note = openNotes.get(trackId);
+                        note.endTime = event.timestamp_ms;
+                        note.yIndex = uniqueInstruments.indexOf(trackId);
+                        parsedNotes.push(note);
+                        openNotes.delete(trackId);
+                    }
+                });
+
+                viewerCtx.clearRect(0, 0, 2048, 1024);
+                viewerCtx.fillStyle = '#111111';
+                viewerCtx.fillRect(0, 0, 2048, 1024);
+                const rowHeight = 1024 / Math.max(uniqueInstruments.length, 1);
+                viewerCtx.strokeStyle = '#333333'; viewerCtx.lineWidth = 2;
+                for (let i = 0; i < uniqueInstruments.length; i++) { viewerCtx.beginPath(); viewerCtx.moveTo(0, i * rowHeight); viewerCtx.lineTo(2048, i * rowHeight); viewerCtx.stroke(); }
+
+                const rawData = decodedBuffer.getChannelData(0);
+                const samplesPerPixel = decodedBuffer.sampleRate / (2048 / decodedBuffer.duration);
+                
+                viewerCtx.fillStyle = 'rgba(0, 255, 204, 0.25)';
+                const midY = 512; 
+                const amp = 450;
+
+                viewerCtx.beginPath();
+                viewerCtx.moveTo(0, midY);
+                for (let i = 0; i < 2048; i++) {
+                    let min = 1.0, max = -1.0;
+                    for (let j = 0; j < samplesPerPixel; j++) {
+                        const idx = Math.floor(i * samplesPerPixel) + j;
+                        if (idx < rawData.length) {
+                            const datum = rawData[idx];
+                            if (datum < min) min = datum;
+                            if (datum > max) max = datum;
+                        }
+                    }
+                    viewerCtx.lineTo(i, midY + (min * amp));
+                    viewerCtx.lineTo(i, midY + (max * amp));
+                }
+                viewerCtx.fill();
+
+                parsedNotes.forEach(note => {
+                    const x = (note.startTime / viewerDurationMs) * 2048;
+                    const width = ((note.endTime - note.startTime) / viewerDurationMs) * 2048;
+                    const y = note.yIndex * rowHeight;
+                    
+                    if (note.type === 'bongo') viewerCtx.fillStyle = '#dd9955';
+                    else if (note.type === 'key') viewerCtx.fillStyle = '#00ffff';
+                    else if (note.type === 'harp') viewerCtx.fillStyle = '#ffffff';
+                    else if (note.type === 'pad') viewerCtx.fillStyle = '#ff00ff';
+                    else if (note.type === 'vocals') viewerCtx.fillStyle = '#aa00ff';
+                    else if (note.type === 'metronome') viewerCtx.fillStyle = '#ffaa00';
+                    else viewerCtx.fillStyle = '#aaaaaa';
+
+                    viewerCtx.globalAlpha = Math.max(0.3, Math.min(note.velocity / 5.0, 1.0));
+                    viewerCtx.fillRect(x, y + 4, Math.max(width, 4), rowHeight - 8); 
+                });
+                viewerCtx.globalAlpha = 1.0;
+
+                // D. Force GPU Texture Upload
+                viewerTexture.needsUpdate = true;
+                logSystem("✅ VR VIEWER RENDERED SUCCESSFULLY");
+            } catch (err) {
+                console.error("VR Viewer Render Error:", err);
+                logSystem("⚠️ VIEWER RENDER FAILED");
+            }
+        }
+
+        // ==========================================
+        // 6. INPUT & CONTINUOUS COLLISION LOOP
+        // ==========================================
+        function setupHands() {
+            handModelFactory = new XRHandModelFactory();
+            hand1 = renderer.xr.getHand(0); hand1.add(handModelFactory.createHandModel(hand1, "mesh")); scene.add(hand1);
+            hand2 = renderer.xr.getHand(1); hand2.add(handModelFactory.createHandModel(hand2, "mesh")); scene.add(hand2);
+        }
+
+        function releaseHandKeys(handUUID) {
+            const keysToRelease = [];
+            for (let trackKey of activeFingers.keys()) {
+                if (trackKey.startsWith(handUUID)) keysToRelease.push(trackKey);
+            }
+            keysToRelease.forEach(k => forceRelease(k));
+        }
+
+        function processControllers(dt) {
+            const session = renderer.xr.getSession();
+            if (session) {
+                for (const source of session.inputSources) {
+                    if (!source.gamepad) continue;
+                    if (source.handedness === 'right') {
+                        if (Math.abs(source.gamepad.axes[3]) > 0.1) worldGroup.position.y -= source.gamepad.axes[3] * 0.5 * dt; 
+                        const isRightClicked = source.gamepad.buttons[3] && source.gamepad.buttons[3].pressed;
+                        if (isRightClicked && !rightThumbstickPressed) { useStringJoints = !useStringJoints; logSystem(`Tracking -> ${useStringJoints ? 'STRING' : 'NUMERIC'}`); }
+                        rightThumbstickPressed = isRightClicked;
+
+                        const isA = source.gamepad.buttons[4] && source.gamepad.buttons[4].pressed;
+                        if (isA && !aButtonPressed) toggleRecording(); aButtonPressed = isA;
+                        const isB = source.gamepad.buttons[5] && source.gamepad.buttons[5].pressed;
+                        if (isB && !bButtonPressed) togglePlayback(); bButtonPressed = isB;
+                    }
+                    if (source.handedness === 'left') {
+                        const isLeftClicked = source.gamepad.buttons[3] && source.gamepad.buttons[3].pressed;
+                        if (isLeftClicked && !leftThumbstickPressed) { hitMode = hitMode === 'advanced' ? 'basic' : 'advanced'; logSystem(`Hit Mode -> ${hitMode.toUpperCase()}`); }
+                        leftThumbstickPressed = isLeftClicked;
+                        
+                        const isX = source.gamepad.buttons[4] && source.gamepad.buttons[4].pressed;
+                        if (isX && !leftXButtonPressed) { showJointDots = !showJointDots; logSystem(`Joint Dots -> ${showJointDots ? 'ON' : 'OFF'}`); }
+                        leftXButtonPressed = isX;
+
+                        const thumbstickX = source.gamepad.axes[2];
+                        if (thumbstickX > 0.5 && !leftThumbstickXPressed) { currentKitIndex = (currentKitIndex + 1) % DRUM_KITS.length; updateDrumVisuals(); leftThumbstickXPressed = true; }
+                        else if (thumbstickX < -0.5 && !leftThumbstickXPressed) { currentKitIndex = (currentKitIndex - 1 + DRUM_KITS.length) % DRUM_KITS.length; updateDrumVisuals(); leftThumbstickXPressed = true; }
+                        else if (Math.abs(thumbstickX) < 0.2) leftThumbstickXPressed = false;
+                    }
+                }
+            }
+        }
+
+        // --- UNIVERSAL SUSTAIN KILL-SWITCH ---
+        function forceRelease(trackKey) {
+            if (!activeFingers.has(trackKey)) return;
+            const heldData = activeFingers.get(trackKey);
+            activeFingers.delete(trackKey);
+            
+            // 1. Instantly stop the specific audio envelope tied to THIS finger
+            if (heldData.releaseFn) heldData.releaseFn();
+            
+            // 2. Log the MIDI Note-Off
+            logHit(heldData.fingerName, heldData.rawKey, heldData.id, heldData.type, 0, { edge: "N/A", freq: 0, vol: 0 }, 'release');
+
+            // 3. Unlink from the physical Key/Pad visual state
+            const keyState = activeSustainKeys.get(heldData.id);
+            if (keyState) {
+                keyState.pointers.delete(trackKey);
+                // Only turn the light off if NO fingers are touching the key anymore
+                if (keyState.pointers.size === 0) { 
+                    if (heldData.type === 'key') releaseKeyVisual(heldData.id);
+                    else if (heldData.type === 'pad') releasePadVisual(heldData.id);
+                    activeSustainKeys.delete(heldData.id);
+                }
+            }
+        }
+
+        function processHand(hand, dt) {
+            if (!hand.joints || Object.keys(hand.joints).length === 0) { releaseHandKeys(hand.uuid); return; }
+
+            const wrist = hand.joints['wrist']; const indexTip = hand.joints['index-finger-tip'];
+            if (wrist && indexTip) {
+                const wPos = new THREE.Vector3().setFromMatrixPosition(wrist.matrixWorld); const iPos = new THREE.Vector3().setFromMatrixPosition(indexTip.matrixWorld);
+                if (wPos.distanceTo(iPos) < 0.02) { hand.visible = false; releaseHandKeys(hand.uuid); return; } 
+                else { hand.visible = true; }
+            } else { releaseHandKeys(hand.uuid); return; }
+
+            if (!hand.userData.dotsAdded) {
+                for (const jointName of XR_JOINT_NAMES) {
+                    const joint = hand.joints[jointName];
+                    if (joint) { const dot = new THREE.Mesh(jointDotGeo, jointDotMat); dot.name = 'jointDot'; joint.add(dot); }
+                }
+                hand.userData.dotsAdded = true;
+            }
+            for (const jointName of XR_JOINT_NAMES) {
+                const joint = hand.joints[jointName];
+                if (joint) { for (let i = 0; i < joint.children.length; i++) { if (joint.children[i].name === 'jointDot') joint.children[i].visible = showJointDots; } }
+            }
+            const targetOpacity = showJointDots ? 0.35 : 1.0;
+            hand.traverse((child) => {
+                if (child.isSkinnedMesh && child.material && child.material.opacity !== targetOpacity) {
+                    child.material.transparent = true; child.material.opacity = targetOpacity; child.material.depthWrite = !showJointDots; child.material.needsUpdate = true;
+                }
+            });
+
+            // Shaker Physics
+            const thumb = hand.joints['thumb-tip'];
+            if (thumb && indexTip && wrist) {
+                const tPos = new THREE.Vector3().setFromMatrixPosition(thumb.matrixWorld);
+                const iPos = new THREE.Vector3().setFromMatrixPosition(indexTip.matrixWorld);
+                const wPos = new THREE.Vector3().setFromMatrixPosition(wrist.matrixWorld);
+                const isPinching = tPos.distanceTo(iPos) < 0.035; const lastPinch = hand.userData.isPinching || false;
+                hand.userData.isPinching = isPinching;
+                
+                if (isPinching && !lastPinch) {
+                    if (holdingHandUUID === hand.uuid) {
+                        holdingHandUUID = null; shakerMesh.userData.isHeld = false; shakerMesh.position.copy(shakerBasePos); logSystem("Dropped Shaker");
+                    } else if (!holdingHandUUID) {
+                        if (wPos.distanceTo(shakerBasePos.clone().add(worldGroup.position)) < 0.15) {
+                            holdingHandUUID = hand.uuid; shakerMesh.userData.isHeld = true; logSystem("Grabbed Shaker");
+                        }
+                    }
+                }
+
+                if (holdingHandUUID === hand.uuid) {
+                    shakerMesh.position.copy(wPos.clone().sub(worldGroup.position)); 
+                    const currentPos = wPos.clone();
+                    if (!hand.userData.lastWristPos) hand.userData.lastWristPos = currentPos.clone();
+                    if (!hand.userData.lastWristVel) hand.userData.lastWristVel = new THREE.Vector3();
+                    
+                    const velocity = new THREE.Vector3().subVectors(currentPos, hand.userData.lastWristPos).divideScalar(dt);
+                    const acceleration = new THREE.Vector3().subVectors(velocity, hand.userData.lastWristVel).divideScalar(dt);
+                    
+                    const now = performance.now();
+                    if (acceleration.length() > 40 && now > (hand.userData.shakerCooldown || 0)) {
+                        const velMag = velocity.length();
+                        const telemetry = playShakerHit(velMag);
+                        logHit("Wrist", "[Kinetic]", "shaker", "shaker", velMag, telemetry);
+                        hand.userData.shakerCooldown = now + 80; 
+                    }
+                    hand.userData.lastWristPos.copy(currentPos); hand.userData.lastWristVel.copy(velocity);
+                }
+            }
+
+            const currentJoints = useStringJoints ? STRING_JOINTS : NUMERIC_JOINTS;
+            const detectedHits = []; 
+
+            for (const [key, fingerName] of Object.entries(currentJoints)) {
+                const jointKey = useStringJoints ? key : XR_JOINT_NAMES[parseInt(key)];
+                const joint = hand.joints[jointKey];
+                const trackKey = `${hand.uuid}_${key}`;
+                if (!joint) {
+                    // If a specific finger loses tracking while holding a note, kill the note instantly!
+                    forceRelease(trackKey);
+                    continue;
+                }
+
+                const currentPos = new THREE.Vector3();
+                if (fingerName === 'Palm') currentPos.copy(new THREE.Vector3(0, -0.032, 0.01).applyMatrix4(joint.matrixWorld));
+                else if (fingerName === 'Heel') currentPos.copy(new THREE.Vector3(0, -0.04, 0.01).applyMatrix4(joint.matrixWorld));
+                else { currentPos.setFromMatrixPosition(joint.matrixWorld); currentPos.y += 0.01; } // Fingertip race offset
+
+                
+                // Continuous Bounds Checking (Sustain)
+                if (useKeySustain && activeFingers.has(trackKey)) {
+                    const heldData = activeFingers.get(trackKey);
+                    let activeInstData = heldData.type === 'key' ? pianoKeys.find(k => k.note === heldData.id) : samplerPads.find(p => p.name === heldData.id);
+
+                    if (activeInstData) {
+                        const absoluteTopY = activeInstData.baseY + worldGroup.position.y;
+                        const absoluteCenterX = activeInstData.baseCenter.x + worldGroup.position.x;
+                        const absoluteCenterZ = activeInstData.baseCenter.z + worldGroup.position.z;
+                        const hw = activeInstData.width / 2; const hl = activeInstData.length / 2;
+
+                        const isInside = currentPos.y <= absoluteTopY + 0.005 && currentPos.y >= absoluteTopY - 0.08 &&
+                                         currentPos.x >= absoluteCenterX - hw && currentPos.x <= absoluteCenterX + hw &&
+                                         currentPos.z >= absoluteCenterZ - hl && currentPos.z <= absoluteCenterZ + hl;
+
+                        if (!isInside) {
+                            // The finger physically left the bounds box
+                            forceRelease(trackKey);
+                        } else {
+                            // Still holding it down, skip collision checks for this finger this frame
+                            if (fingerData.has(trackKey)) fingerData.get(trackKey).copy(currentPos);
+                            continue; 
+                        }
+                    }
+                }
+
+                if (!fingerData.has(trackKey)) { fingerData.set(trackKey, currentPos.clone()); continue; }
+                const prevPos = fingerData.get(trackKey);
+                let hitRegistered = false;
+
+                // A. Bongo
+                for (let drum of bongos) {
+                    const absoluteHeadY = drum.baseY + worldGroup.position.y;
+                    if (prevPos.y > absoluteHeadY && currentPos.y <= absoluteHeadY) {
+                        const t = (absoluteHeadY - prevPos.y) / (currentPos.y - prevPos.y);
+                        const intersectX = prevPos.x + (currentPos.x - prevPos.x) * t;
+                        const intersectZ = prevPos.z + (currentPos.z - prevPos.z) * t;
+                        const distFromCenter = Math.sqrt(Math.pow(intersectX - (drum.baseCenter.x + worldGroup.position.x), 2) + Math.pow(intersectZ - (drum.baseCenter.z + worldGroup.position.z), 2));
+
+                        if (distFromCenter <= drum.radius) {
+                            detectedHits.push({ type: 'bongo', fingerName, rawKey: key, id: drum.name, velocity: Math.min(prevPos.distanceTo(currentPos) / dt, 5), edgeRatio: distFromCenter / drum.radius });
+                            hitRegistered = true; break;
+                        }
+                    }
+                }
+                if (hitRegistered) { prevPos.copy(currentPos); continue; }
+
+                // B. Keyboard
+                for (let keyMesh of pianoKeys) {
+                    const absoluteTopY = keyMesh.baseY + worldGroup.position.y;
+                    if (prevPos.y > absoluteTopY && currentPos.y <= absoluteTopY) {
+                        const t = (absoluteTopY - prevPos.y) / (currentPos.y - prevPos.y);
+                        const intersectX = prevPos.x + (currentPos.x - prevPos.x) * t;
+                        const intersectZ = prevPos.z + (currentPos.z - prevPos.z) * t;
+                        const absCx = keyMesh.baseCenter.x + worldGroup.position.x; const absCz = keyMesh.baseCenter.z + worldGroup.position.z;
+                        if (intersectX >= absCx - (keyMesh.width/2) && intersectX <= absCx + (keyMesh.width/2) && intersectZ >= absCz - (keyMesh.length/2) && intersectZ <= absCz + (keyMesh.length/2)) {
+                            detectedHits.push({ type: 'key', fingerName, rawKey: key, id: keyMesh.note, velocity: Math.min(prevPos.distanceTo(currentPos) / dt, 5), freq: keyMesh.freq });
+                            hitRegistered = true; break; 
+                        }
+                    }
+                }
+                if (hitRegistered) { prevPos.copy(currentPos); continue; }
+
+                // B. 2 Sampler Pads
+                for (let pad of samplerPads) {
+                    const absoluteTopY = pad.baseY + worldGroup.position.y;
+                    if (prevPos.y > absoluteTopY && currentPos.y <= absoluteTopY) {
+                        const t = (absoluteTopY - prevPos.y) / (currentPos.y - prevPos.y);
+                        const intersectX = prevPos.x + (currentPos.x - prevPos.x) * t;
+                        const intersectZ = prevPos.z + (currentPos.z - prevPos.z) * t;
+                        const absCx = pad.baseCenter.x + worldGroup.position.x; const absCz = pad.baseCenter.z + worldGroup.position.z;
+                        if (intersectX >= absCx - (pad.width/2) && intersectX <= absCx + (pad.width/2) && intersectZ >= absCz - (pad.length/2) && intersectZ <= absCz + (pad.length/2)) {
+                            detectedHits.push({ type: 'pad', fingerName, rawKey: key, id: pad.name, velocity: Math.min(prevPos.distanceTo(currentPos) / dt, 5), freq: 0 });
+                            hitRegistered = true; break; 
+                        }
+                    }
+                }
+                if (hitRegistered) { prevPos.copy(currentPos); continue; }
+
+                // C. Harp
+                for (let str of harpStrings) {
+                    const absoluteX = str.x + worldGroup.position.x;
+                    if ((prevPos.x < absoluteX && currentPos.x >= absoluteX) || (prevPos.x > absoluteX && currentPos.x <= absoluteX)) {
+                        const t = (absoluteX - prevPos.x) / (currentPos.x - prevPos.x);
+                        const intersectZ = prevPos.z + (currentPos.z - prevPos.z) * t;
+                        const intersectY = prevPos.y + (currentPos.y - prevPos.y) * t;
+                        if (Math.abs(intersectZ - (str.z + worldGroup.position.z)) < 0.0125 && intersectY >= (str.bottomY + worldGroup.position.y) && intersectY <= (str.topY + worldGroup.position.y)) {
+                            detectedHits.push({ type: 'harp', fingerName, rawKey: key, id: str.note, velocity: Math.min(prevPos.distanceTo(currentPos) / dt, 5), freq: str.freq });
+                            hitRegistered = true; break; 
+                        }
+                    }
+                }
+                if (hitRegistered) { prevPos.copy(currentPos); continue; }
+
+                // UI BUTTON CHECKS
+                const checkButtons = (buttons, actionCallback) => {
+                    for (let btn of buttons) {
+                        const absolutePos = btn.worldOffset.clone().add(worldGroup.position);
+                        if (currentPos.distanceTo(absolutePos) < btn.activationRadius) {
+                            const now = performance.now();
+                            if (now > globalMenuCooldown) { actionCallback(btn); globalMenuCooldown = now + 400; }
+                            hitRegistered = true; break;
+                        }
+                    }
+                };
+
+                if (!hitRegistered) checkButtons(vrButtons, btn => {
+                    if (btn.type === 'drum_kit') { currentKitIndex = btn.index; updateDrumVisuals(); }
+                    else if (btn.type === 'key_mode') currentKeyModeIndex = btn.index;
+                    else if (btn.type === 'harp_mode') currentHarpModeIndex = btn.index;
+                    else if (btn.type === 'shaker_mode') currentShakerModeIndex = btn.index;
+                    updateMenuVisuals(); playMenuBlip(); logSystem(`Selected: ${btn.label}`);
+                });
+
+                if (!hitRegistered) checkButtons(transportButtons, btn => {
+                    if (btn.action === 'REC' && !isRecording) toggleRecording();
+                    else if (btn.action === 'STOP') { if (isRecording) toggleRecording(); if (isPlayingBack) togglePlayback(); }
+                    else if (btn.action === 'PLAY' && !isPlayingBack) togglePlayback();
+                    else if (btn.action === 'METRO') {
+                        if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+                        isMetronomeOn = !isMetronomeOn; lastBeatTime = 0; beatCount = 0; logSystem(`Metronome: ${isMetronomeOn ? 'ON' : 'OFF'}`);
+                    } else if (btn.action === 'MIC') toggleMicrophone();
+                    updateTransportVisuals(); playMenuBlip();
+                });
+
+                if (!hitRegistered) checkButtons(metroUIButtons, btn => {
+                    if (btn.action === 'BPM_DOWN') bpm = Math.max(40, bpm - 5);
+                    else if (btn.action === 'BPM_UP') bpm = Math.min(240, bpm + 5);
+                    else if (btn.action === 'EMPHASIS') metronomeEmphasis = !metronomeEmphasis;
+                    else if (btn.action === 'TIMBRE') currentMetroModeIndex = (currentMetroModeIndex + 1) % METRO_MODES.length;
+                    else if (btn.action === 'REC_METRO') recordMetronome = !recordMetronome;
+                    else if (btn.action === 'VID_REC') toggleScreenRecord();
+                    else if (btn.action === 'RESET_WS') resetWorkspace();
+                    updateMetroUIVisuals(); playMenuBlip(); 
+                    if (btn.action !== 'VID_REC' && btn.action !== 'RESET_WS') logSystem(`METRO: ${bpm} BPM | ${METRO_MODES[currentMetroModeIndex].name}`);
+                });
+
+                if (!hitRegistered) checkButtons(looperUIButtons, btn => { toggleLooper(btn.index); playMenuBlip(); });
+
+                prevPos.copy(currentPos);
+            }
+
+            // Hit Dispatcher
+            if (detectedHits.length > 0) {
+                const processHitList = (hits) => {
+                    for (let hit of hits) {
+                        let telemetry;
+                        if (hit.type === 'bongo') telemetry = playDrumHit(hit.id, hit.velocity, hit.edgeRatio, hit.fingerName);
+                        else if (hit.type === 'harp') telemetry = playHarpPluck(hit.freq, hit.velocity);
+                        else if (hit.type === 'key' || hit.type === 'pad') {
+                            telemetry = hit.type === 'key' ? playKeyHit(hit.freq, hit.velocity) : playPadHit(hit.id, hit.velocity);
+                            
+                            if (useKeySustain) {
+                                const trackKey = `${hand.uuid}_${hit.rawKey}`;
+                                
+                                // STORE THE DSP RELEASE HOOK ON THE FINGER, NOT THE KEY
+                                activeFingers.set(trackKey, { 
+                                    id: hit.id, 
+                                    fingerName: hit.fingerName, 
+                                    rawKey: hit.rawKey, 
+                                    type: hit.type,
+                                    releaseFn: telemetry.releaseFn 
+                                });
+                                
+                                if (!activeSustainKeys.has(hit.id)) {
+                                    // Visual state manager only needs to know how many fingers are present
+                                    activeSustainKeys.set(hit.id, { pointers: new Set([trackKey]) });
+                                    if (hit.type === 'key') pressKeyVisual(hit.id); else pressPadVisual(hit.id);
+                                } else {
+                                    activeSustainKeys.get(hit.id).pointers.add(trackKey);
+                                }
+                            }
+                        }
+                        logHit(hit.fingerName, hit.rawKey, hit.id, hit.type, hit.velocity, telemetry);
+                    }
+                };
+
+                if (hitMode === 'basic') processHitList(detectedHits);
+                else {
+                    const now = performance.now();
+                    if (now > (handCooldowns.get(hand.uuid) || 0)) {
+                        const fleshHits = detectedHits.filter(h => h.fingerName === 'Heel' || h.fingerName === 'Palm');
+                        if (fleshHits.length > 0) { processHitList(fleshHits); handCooldowns.set(hand.uuid, now + 120); } 
+                        else { processHitList(detectedHits); handCooldowns.set(hand.uuid, now + 50); }
+                    }
+                }
+            }
+        }
+
+        function render() {
+            const dt = clock.getDelta(); const now = performance.now();
+
+            if (renderer.xr.isPresenting) {
+                processControllers(dt);
+                processHand(hand1, dt);
+                processHand(hand2, dt);
+
+                if (isRecording || isPlayingBack) {
+                    if (now - lastHudUpdateTime > 100) { updateHUD(); lastHudUpdateTime = now; }
+                }
+            }
+
+            // GHOST JSON INJECTION FOR LOOPERS
+            if (isRecording) {
+                loopers.forEach((loop, i) => {
+                    if (loop.state === 'PLAY' && loop.durationMs > 0) {
+                        const currentLoopTime = ((audioCtx.currentTime - loop.playStartTime) * 1000) % loop.durationMs;
+                        if (loop.lastLoopTime === undefined) loop.lastLoopTime = currentLoopTime;
+                        const timeA = loop.lastLoopTime; const timeB = currentLoopTime;
+
+                        loop.telemetry.forEach(ev => {
+                            let fired = false;
+                            if (timeB >= timeA) { if (ev.loop_time_ms > timeA && ev.loop_time_ms <= timeB) fired = true; } 
+                            else { if (ev.loop_time_ms > timeA || ev.loop_time_ms <= timeB) fired = true; }
+
+                            if (fired) {
+                                const clone = { ...ev }; delete clone.loop_time_ms;
+                                clone.timestamp_ms = parseFloat((performance.now() - recordingStartTime).toFixed(2));
+                                clone.is_loop_ghost = true; clone.loop_track = i + 1;
+                                sessionTelemetry.push(clone);
+                            }
+                        });
+                        loop.lastLoopTime = currentLoopTime;
+                    }
+                });
+            }
+
+            // VR PIANO ROLL PLAYHEAD
+            if (isPlayingBack && viewerDurationMs > 0) {
+                playheadMesh.visible = true;
+                const elapsedMs = (audioCtx.currentTime - playbackStartTime) * 1000;
+                const xPos = - (VIEWER_WIDTH / 2) + ((elapsedMs / viewerDurationMs) * VIEWER_WIDTH);
+                playheadMesh.position.x = Math.min(xPos, VIEWER_WIDTH / 2);
+            } else if (playheadMesh) playheadMesh.visible = false;
+
+            // METRONOME TICKER
+            if (audioCtx && isMetronomeOn) {
+                const msPerBeat = 60000 / bpm;
+                if (now - lastBeatTime >= msPerBeat) {
+                    lastBeatTime = now; beatCount = (beatCount % 4) + 1; 
+                    if (window.playMetronomeTick) window.playMetronomeTick(beatCount === 1); 
+                    hudContext.strokeStyle = beatCount === 1 ? '#ffaa00' : '#ffffff';
+                    hudContext.lineWidth = 12; hudContext.strokeRect(0, 0, hudCanvas.width, hudCanvas.height);
+                    hudTexture.needsUpdate = true;
+                    setTimeout(() => { updateHUD(); }, 100); 
+                }
+            }
+
+            renderer.render(scene, camera);
+        }
+
+    </script>
+</body>
+</html>
